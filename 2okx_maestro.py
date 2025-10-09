@@ -1,7 +1,13 @@
 # -*- coding: utf-8 -*-
 # =======================================================================================
-# --- 🚀 OKX Maestro Bot V9.2 (Architectural Refactor) 🚀 ---
+# --- 🚀 OKX Maestro Bot V9.5 (مع ميزة التبني التفاعلي للصفقات اليتيمة) 🚀 ---
 # =======================================================================================
+#
+# --- سجل التغييرات للإصدار 9.5 (التبني التفاعلي) ---
+#   ✅ [ميزة V9.5] **التبني التفاعلي للصفقات اليتيمة:** إضافة منطق كشف وإدارة المراكز اليتيمة في the_supervisor_job مع إشعارات تليجرام وخيارات تبني/تصفية، بالإضافة إلى إعادة بناء الصفقات في قاعدة البيانات.
+#   ✅ [ميزة V9.5] **الجدولة الآلية:** استخدام job_queue للتصفية التلقائية بعد 15 دقيقة إذا لم يتم الرد.
+#   ✅ [إصلاح V9.5] **تصحيح حساب قيمة الأصول:** استخدام fetch_ticker للحصول على السعر الحالي بدلاً من market()['price'] في كشف اليتيمة.
+#   ✅ [إصلاح V9.5] **تحسين النصوص:** تصحيح نص الزر "تصفية الآن" وإضافة معالجة أفضل للأخطاء في reconstruct_trade.
 #
 # --- سجل التغييرات للإصدار 9.2 (تطوير معماري) ---
 #   ✅ [هيكلة] **توحيد إدارة الصفقات:** تم إعادة هيكلة منطق التداول. أصبح `WiseMan` يعمل كـ "مستشار استراتيجي" يقدم توصيات فقط.
@@ -232,6 +238,16 @@ SETTINGS_PRESETS = {
         "min_win_probability": 0.45,
     }
 }
+def format_price(price):
+    if price is None: return "N/A"
+    if price < 0.01 and price > 0: return f"{price:,.8g}"
+    return f"{price:,.4f}"
+
+def generate_tradingview_link(symbol: str, exchange: str = "OKX") -> str:
+    tv_symbol = symbol.replace('/', '')
+    return f"https://www.tradingview.com/chart/?symbol={exchange.upper()}:{tv_symbol.upper()}"
+
+
 # --- الحالة العامة للبوت ---
 class BotState:
     def __init__(self):
@@ -251,6 +267,8 @@ class BotState:
         self.last_deep_analysis_time = defaultdict(float)
         self.trade_management_lock = asyncio.Lock()
         self.trade_update_recommendations = {}
+        self.news_cache = {}
+        self.pending_orphan_alerts = set()
 
 bot_data = BotState()
 wise_man = None
@@ -1313,6 +1331,11 @@ class TradeGuardian:
                         return
 
                     trade = dict(trade)
+
+                    if trade.get('status') == 'force_exit_thesis_invalid':
+                        await self._close_trade(trade, "فاشلة (بطلان الفرضية)", current_price)
+                        return
+
                     protocol_id = trade.get('management_protocol', 1)
 
                     # --- [V9.2] تحديث أعلى سعر (مشترك لجميع البروتوكولات) ---
@@ -1656,9 +1679,9 @@ class TradeGuardian:
                 f"💰 **صافي الربح/الخسارة:** `${pnl:,.2f}` `({pnl_percent:+.2f}%)`\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
                 f"⏳ **مدة الصفقة:** `{duration_str}`\n"
-                f"📉 **متوسط سعر الدخول:** `${trade['entry_price']:,.4f}`\n"
-                f"📈 **متوسط سعر الخروج:** `${close_price:,.4f}`\n"
-                f"🔝 **أعلى سعر وصلت إليه:** `${highest_price_reached:,.4f}`\n"
+                f"📉 **متوسط سعر الدخول:** `${format_price(trade['entry_price'])}`\n"
+                f"📈 **متوسط سعر الخروج:** `${format_price(close_price)}`\n"
+                f"🔝 **أعلى سعر وصلت إليه:** `${format_price(highest_price_reached)}`\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
                 f"🧠 **كفاءة الخروج:** `{exit_efficiency:.2f}%`"
             )
@@ -1723,10 +1746,137 @@ async def the_supervisor_job(context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.error(f"🚨 Supervisor failed to intervene for trade #{trade['id']}: {e}")
 
+    # --- [V9.5] State Reconciliation Logic ---
+    logger.info("🕵️ Supervisor: Reconciling exchange portfolio with DB...")
+    try:
+        balance = await safe_api_call(lambda: bot_data.exchange.fetch_balance())
+        if not balance: return
+
+        # Get assets held on the exchange with a value > $2
+        exchange_assets = {}
+        for asset, data in balance.items():
+            if asset == 'USDT' or data.get('total', 0) <= 0: continue
+            symbol_usdt = f"{asset}/USDT"
+            if symbol_usdt not in bot_data.exchange.markets: continue
+            ticker = await safe_api_call(lambda: bot_data.exchange.fetch_ticker(symbol_usdt))
+            if not ticker: continue
+            current_price = ticker['last']
+            value_usd = data['total'] * current_price
+            if value_usd > 2:
+                exchange_assets[asset] = data['total']
+
+        # Get active trades from the bot's database
+        async with aiosqlite.connect(DB_FILE) as conn:
+            cursor = await conn.execute("SELECT symbol FROM trades WHERE status = 'active'")
+            db_active_symbols = {row[0].split('/')[0] for row in await cursor.fetchall()}
+
+        # Find the orphans
+        for asset, quantity in exchange_assets.items():
+            if asset not in db_active_symbols:
+                logger.warning(f"🕵️ Supervisor found an orphaned position: {quantity} {asset}")
+                symbol_usdt = f"{asset}/USDT"
+                # Call the handler to start the interactive process
+                await handle_orphaned_trade(context, symbol_usdt, quantity)
+
+    except Exception as e:
+        logger.error(f"Error during state reconciliation: {e}", exc_info=True)
+
+# --- [V9.5] Core Interaction and Action Functions ---
+async def handle_orphaned_trade(context: ContextTypes.DEFAULT_TYPE, symbol: str, quantity: float):
+    """Sends the initial alert for an orphaned trade and schedules auto-liquidation."""
+    if symbol in bot_data.pending_orphan_alerts:
+        return # Avoid duplicate alerts
+    
+    bot_data.pending_orphan_alerts.add(symbol)
+    base_currency = symbol.split('/')[0]
+    timeout_minutes = 15
+
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ تبني الصفقة", callback_data=f"orphan_adopt_{symbol}"),
+            InlineKeyboardButton("تصفية الآن", callback_data=f"orphan_liquidate_{symbol}")
+        ]
+    ]
+    
+    message = (
+        f"🕵️‍♂️ **تنبيه من المدقق:** تم العثور على مركز يتيم!\n\n"
+        f"▫️ **العملة:** `${base_currency}`\n"
+        f"▫️ **الكمية:** `{quantity}`\n\n"
+        f"**الإجراء الافتراضي هو التصفية التلقائية بعد {timeout_minutes} دقيقة.** ما هو قرارك؟"
+    )
+    
+    await safe_send_message(context.bot, message, reply_markup=InlineKeyboardMarkup(keyboard))
+
+    # Schedule the automatic liquidation job
+    job_name = f"orphan_liquidation_{symbol}"
+    context.job_queue.run_once(
+        liquidate_orphaned_position, 
+        timeout_minutes * 60, 
+        context={'symbol': symbol}, 
+        name=job_name
+    )
+
+async def liquidate_orphaned_position(context: ContextTypes.DEFAULT_TYPE):
+    """Called by the job queue or a button to sell an orphaned position."""
+    job_context = context.job.context
+    symbol = job_context['symbol']
+    
+    logger.warning(f"Executing liquidation for orphaned position: {symbol}")
+    try:
+        balance = await safe_api_call(lambda: bot_data.exchange.fetch_balance())
+        base_currency = symbol.split('/')[0]
+        quantity = balance.get(base_currency, {}).get('total', 0.0)
+        
+        if quantity > 0:
+            await safe_api_call(lambda: bot_data.exchange.create_market_sell_order(symbol, quantity))
+            await safe_send_message(context.bot, f"✅ **تمت التصفية:** تم بيع المركز اليتيم لـ `${base_currency}` بنجاح.")
+        else:
+             await safe_send_message(context.bot, f"ℹ️ تم إلغاء التصفية لـ `${base_currency}` لعدم وجود رصيد.")
+
+    except Exception as e:
+        logger.error(f"Failed to liquidate orphaned position {symbol}: {e}")
+        await safe_send_message(context.bot, f"🚨 **فشل التصفية:** حدث خطأ أثناء محاولة بيع `${base_currency}`. يرجى المراجعة اليدوية.")
+    
+    if symbol in bot_data.pending_orphan_alerts:
+        bot_data.pending_orphan_alerts.remove(symbol)
+
+async def reconstruct_trade(symbol: str, entry_price: float, quantity: float):
+    """Re-creates a trade in the database after user adoption."""
+    logger.info(f"Reconstructing trade for {symbol} with entry price {entry_price}")
+    try:
+        ticker = await safe_api_call(lambda: bot_data.exchange.fetch_ticker(symbol))
+        if not ticker: raise Exception("Failed to fetch ticker")
+        current_price = ticker['last']
+        
+        # Calculate default SL/TP
+        ohlcv = await safe_api_call(lambda: bot_data.exchange.fetch_ohlcv(symbol, '15m', limit=20))
+        if not ohlcv or len(ohlcv) < 14: raise Exception("Insufficient OHLCV data")
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        atr = ta.atr(df['high'], df['low'], df['close'], length=14).iloc[-1]
+        risk = atr * bot_data.settings['atr_sl_multiplier']
+        stop_loss = entry_price - risk
+        take_profit = entry_price + (risk * bot_data.settings['risk_reward_ratio'])
+        
+        async with aiosqlite.connect(DB_FILE) as conn:
+            await conn.execute("""
+                INSERT INTO trades (timestamp, symbol, reason, status, entry_price, take_profit, stop_loss, quantity, management_protocol)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                datetime.now(EGYPT_TZ).isoformat(), symbol, "تبني يدوي", 'active',
+                entry_price, take_profit, stop_loss, quantity, 2 # Default to Protocol 2
+            ))
+            await conn.commit()
+        
+        await bot_data.public_ws.subscribe([symbol])
+        return True
+    except Exception as e:
+        logger.error(f"Failed to reconstruct trade for {symbol}: {e}")
+        return False
+
 # --- واجهة تليجرام ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [["Dashboard 🖥️"], ["الإعدادات ⚙️"]]
-    await update.message.reply_text("أهلاً بك في **بوت OKX V9.2 (التطوير المعماري)**", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True), parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text("أهلاً بك في **بوت OKX V9.5 (التبني التفاعلي)**", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True), parse_mode=ParseMode.MARKDOWN)
 
 async def manual_scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not bot_data.trading_enabled: await (update.message or update.callback_query.message).reply_text("🔬 الفحص محظور. مفتاح الإيقاف مفعل."); return
@@ -1763,6 +1913,24 @@ async def show_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
     else: await target_message.reply_text(message_text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # [V9.5] Handle entry price for orphaned trade adoption
+    if 'awaiting_entry_price_for' in context.user_data:
+        symbol = context.user_data.pop('awaiting_entry_price_for')
+        try:
+            entry_price = float(update.message.text.strip())
+            balance = await safe_api_call(lambda: bot_data.exchange.fetch_balance())
+            base_currency = symbol.split('/')[0]
+            quantity = balance.get(base_currency, {}).get('total', 0.0)
+
+            if await reconstruct_trade(symbol, entry_price, quantity):
+                await update.message.reply_text(f"✅ **تم التبني بنجاح!**\nتمت إضافة صفقة `${base_currency}` إلى قائمة الصفقات النشطة.")
+            else:
+                await update.message.reply_text("🚨 **فشل التبني.** حدث خطأ أثناء إعادة بناء الصفقة. يرجى مراجعة السجلات.")
+        except ValueError:
+            await update.message.reply_text("❌ قيمة غير صالحة. الرجاء إرسال سعر الدخول كرقم فقط.")
+            context.user_data['awaiting_entry_price_for'] = symbol # Re-set state to allow another try
+        return
+
     if 'setting_to_change' in context.user_data or 'blacklist_action' in context.user_data:
         await handle_setting_value(update, context)
         return
@@ -1933,14 +2101,26 @@ async def toggle_kill_switch(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def show_trades_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with aiosqlite.connect(DB_FILE) as conn:
-        conn.row_factory = aiosqlite.Row; trades = await (await conn.execute("SELECT id, symbol, status FROM trades WHERE status = 'active' OR status = 'pending' ORDER BY id DESC")).fetchall()
+        conn.row_factory = aiosqlite.Row
+        trades = await (await conn.execute("SELECT id, symbol, status FROM trades WHERE status = 'active' OR status = 'pending' ORDER BY id DESC")).fetchall()
     if not trades:
         text = "لا توجد صفقات نشطة حاليًا."
         keyboard = [[InlineKeyboardButton("🔙 العودة للوحة التحكم", callback_data="back_to_dashboard")]]
-        await safe_edit_message(update.callback_query, text, reply_markup=InlineKeyboardMarkup(keyboard)); return
-    text = "📈 *الصفقات النشطة*\nاختر صفقة لعرض تفاصيلها:\n"; keyboard = []
-    for trade in trades: status_emoji = "✅" if trade['status'] == 'active' else "⏳"; button_text = f"#{trade['id']} {status_emoji} | {trade['symbol']}"; keyboard.append([InlineKeyboardButton(button_text, callback_data=f"check_{trade['id']}")])
-    keyboard.append([InlineKeyboardButton("🔄 تحديث", callback_data="db_trades")]); keyboard.append([InlineKeyboardButton("🔙 العودة للوحة التحكم", callback_data="back_to_dashboard")]); await safe_edit_message(update.callback_query, text, reply_markup=InlineKeyboardMarkup(keyboard))
+        await safe_edit_message(update.callback_query, text, reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    text = "📈 *الصفقات النشطة*\nاختر صفقة لعرض تفاصيلها:\n"
+    keyboard = []
+    for trade in trades:
+        status_emoji = "✅" if trade['status'] == 'active' else "⏳"
+        base_currency = trade['symbol'].split('/')[0]
+        details_button = InlineKeyboardButton(f"#{trade['id']} ${base_currency}", callback_data=f"check_{trade['id']}")
+        chart_button = InlineKeyboardButton("📊 Chart", url=generate_tradingview_link(trade['symbol']))
+        keyboard.append([details_button, chart_button])
+
+    keyboard.append([InlineKeyboardButton("🔄 تحديث", callback_data="db_trades")])
+    keyboard.append([InlineKeyboardButton("🔙 العودة للوحة التحكم", callback_data="back_to_dashboard")])
+    await safe_edit_message(update.callback_query, text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def check_trade_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1954,10 +2134,16 @@ async def check_trade_details(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.answer("لم يتم العثور على الصفقة."); return
 
     trade = dict(trade)
-    keyboard = [[InlineKeyboardButton("🚨 بيع فوري (بسعر السوق)", callback_data=f"manual_sell_confirm_{trade_id}")], [InlineKeyboardButton("🔙 العودة للصفقات", callback_data="db_trades")]]
+    base_currency = trade['symbol'].split('/')[0]
+    chart_link = generate_tradingview_link(trade['symbol'])
+
+    keyboard = [
+        [InlineKeyboardButton("🚨 بيع فوري (بسعر السوق)", callback_data=f"manual_sell_confirm_{trade_id}")],
+        [InlineKeyboardButton("🔙 العودة للصفقات", callback_data="db_trades")]
+    ]
     
     if trade['status'] == 'pending':
-        message = f"**⏳ حالة الصفقة #{trade_id}**\n- **العملة:** `{trade['symbol']}`\n- **الحالة:** في انتظار تأكيد التنفيذ..."
+        message = f"**⏳ حالة الصفقة #{trade_id}**\n- **العملة:** `${base_currency}`\n- **الحالة:** في انتظار تأكيد التنفيذ...\n\n[📊 فتح الرسم البياني]({chart_link})"
         keyboard = [[InlineKeyboardButton("🔙 العودة للصفقات", callback_data="db_trades")]]
     else:
         try:
@@ -1967,22 +2153,23 @@ async def check_trade_details(update: Update, context: ContextTypes.DEFAULT_TYPE
             pnl = (current_price - trade['entry_price']) * trade['quantity']
             pnl_percent = (current_price / trade['entry_price'] - 1) * 100 if trade['entry_price'] > 0 else 0
             pnl_text = f"💰 **الربح/الخسارة الحالية:** `${pnl:+.2f}` ({pnl_percent:+.2f}%)"
-            current_price_text = f"- **السعر الحالي:** `${current_price}`"
+            current_price_text = f"- **السعر الحالي:** `${format_price(current_price)}`"
         except Exception:
             pnl_text = "💰 تعذر جلب الربح/الخسارة الحالية."
-            current_price_text = "- **السعر الحالي:** `تعذر الجلب`"
+            current_price_text = f"- **السعر الحالي:** `تعذر الجلب`"
 
         message = (
             f"**✅ حالة الصفقة #{trade_id}**\n\n"
-            f"- **العملة:** `{trade['symbol']}`\n"
-            f"- **سعر الدخول:** `${trade['entry_price']}`\n"
+            f"- **العملة:** `${base_currency}`\n"
+            f"- **سعر الدخول:** `${format_price(trade['entry_price'])}`\n"
             f"{current_price_text}\n"
             f"- **الكمية:** `{trade['quantity']}`\n"
             f"----------------------------------\n"
-            f"- **الهدف (TP):** `${trade['take_profit']}`\n"
-            f"- **الوقف (SL):** `${trade['stop_loss']}`\n"
+            f"- **الهدف (TP):** `${format_price(trade['take_profit'])}`\n"
+            f"- **الوقف (SL):** `${format_price(trade['stop_loss'])}`\n"
             f"----------------------------------\n"
-            f"{pnl_text}"
+            f"{pnl_text}\n\n"
+            f"[📊 فتح الرسم البياني]({chart_link})"
         )
     await safe_edit_message(query, message, reply_markup=InlineKeyboardMarkup(keyboard))
 
@@ -2419,7 +2606,9 @@ async def handle_manual_sell_execute(update: Update, context: ContextTypes.DEFAU
             return
             
         current_price = ticker['last']
-        await self._close_trade(trade, "إغلاق يدوي", current_price)
+        
+        await bot_data.trade_guardian._close_trade(trade, "إغلاق يدوي", current_price)
+        
         await query.answer("✅ تم إرسال أمر البيع بنجاح!")
 
     except Exception as e:
@@ -2427,8 +2616,38 @@ async def handle_manual_sell_execute(update: Update, context: ContextTypes.DEFAU
         await safe_send_message(context.bot, f"🚨 فشل البيع اليدوي للصفقة #{trade_id}. السبب: {e}")
         await query.answer("🚨 فشل أمر البيع. راجع السجلات.", show_alert=True)
 
+
 async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer(); data = query.data
+    # [V9.5] Handle orphan buttons
+    if data.startswith("orphan_adopt_"):
+        symbol = data.replace("orphan_adopt_", "")
+        job_name = f"orphan_liquidation_{symbol}"
+        jobs = context.job_queue.get_jobs_by_name(job_name)
+        for job in jobs:
+            job.schedule_removal()
+        
+        context.user_data['awaiting_entry_price_for'] = symbol
+        base_currency = symbol.split('/')[0]
+        await query.message.reply_text(f"📝 حسنًا، لتبني صفقة `${base_currency}`.\nيرجى إرسال **سعر الدخول الأصلي** كرسالة نصية (مثال: `1.234`).")
+        if symbol in bot_data.pending_orphan_alerts:
+            bot_data.pending_orphan_alerts.remove(symbol)
+        return # Important to exit after handling
+
+    elif data.startswith("orphan_liquidate_"):
+        symbol = data.replace("orphan_liquidate_", "")
+        job_name = f"orphan_liquidation_{symbol}"
+        jobs = context.job_queue.get_jobs_by_name(job_name)
+        for job in jobs:
+            job.schedule_removal()
+
+        await query.edit_message_text("⏳ جاري إرسال أمر التصفية...")
+        # Create a mock context for the liquidation function
+        mock_job = type('Job', (), {'context': {'symbol': symbol}})
+        mock_context = type('Context', (), {'job': mock_job, 'bot': context.bot})
+        await liquidate_orphaned_position(mock_context)
+        return
+
     route_map = {
         "db_stats": show_stats_command, "db_trades": show_trades_command, "db_history": show_trade_history_command,
         "db_mood": show_mood_command, "db_diagnostics": show_diagnostics_command, "back_to_dashboard": show_dashboard_command,
@@ -2556,10 +2775,11 @@ async def post_init(application: Application):
     jq.run_repeating(propose_strategy_changes, interval=STRATEGY_ANALYSIS_INTERVAL_SECONDS, first=120, name="propose_strategy_changes")
     jq.run_repeating(wise_man.review_portfolio_risk, interval=3600, first=90, name="wise_man_portfolio_review")
     jq.run_repeating(wise_man.review_active_trades_with_tactics, interval=900, first=120, name="wise_man_tactical_review")
+    jq.run_repeating(wise_man.review_trade_thesis, interval=300, first=45, name="review_trade_thesis")
     jq.run_repeating(wise_man.train_ml_model, interval=604800, first=3600, name="wise_man_ml_train")
 
     logger.info(f"All jobs scheduled. OKX Bot is fully operational.")
-    await application.bot.send_message(TELEGRAM_CHAT_ID, "*🤖 بوت OKX (معماري V9.2) - بدأ العمل...*", parse_mode=ParseMode.MARKDOWN)
+    await application.bot.send_message(TELEGRAM_CHAT_ID, "*🤖 بوت OKX (معماري V9.5) - بدأ العمل...*", parse_mode=ParseMode.MARKDOWN)
 async def post_shutdown(application: Application):
     logger.info("Bot shutdown initiated...")
     if bot_data.websocket_manager:
@@ -2569,7 +2789,7 @@ async def post_shutdown(application: Application):
     logger.info("Bot has shut down gracefully.")
 
 def main():
-    logger.info("Starting OKX Maestro Bot V8.1...")
+    logger.info("Starting OKX Maestro Bot V9.5...")
     app_builder = Application.builder().token(TELEGRAM_BOT_TOKEN)
     app_builder.post_init(post_init).post_shutdown(post_shutdown)
     application = app_builder.build()
