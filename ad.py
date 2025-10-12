@@ -1,9 +1,10 @@
 // =================================================================
-// Advanced Analytics Bot - v148.5 (Multi-Tenant Edition)
+// Advanced Analytics Bot - v149.0 (Multi-Tenant Edition with Enhanced Security & Concurrency)
 // =================================================================
 // --- IMPORTS ---
 const express = require("express");
 const { Bot, Keyboard, InlineKeyboard, webhookCallback } = require("grammy");
+const { conversations, createConversation } = require("grammy-conversations");
 const fetch = require("node-fetch");
 const crypto = require("crypto");
 const WebSocket = require('ws');
@@ -22,7 +23,7 @@ const path = require('path');
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const NEWS_API_KEY = process.env.NEWS_API_KEY;
-const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY; // New: For API key encryption
+const ENCRYPTION_KEY = Buffer.from(process.env.ENCRYPTION_KEY, 'hex'); // 32 bytes for AES-256
 const PORT = process.env.PORT || 3000;
 const TARGET_CHANNEL_ID = process.env.TARGET_CHANNEL_ID;
 const BACKUP_INTERVAL = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
@@ -30,16 +31,18 @@ const BACKUP_INTERVAL = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
 // --- Bot & App Initialization ---
 const app = express();
 const bot = new Bot(BOT_TOKEN);
+bot.use(conversations());
 
-// --- State & Cache Variables ---
-let waitingState = null; // Modified: Now stores { userId, step, tempData }
+// --- State & Cache Variables (Concurrency-Safe) ---
+const userStates = new Map(); // Per-user temporary states
+const wsManagers = new Map(); // Per-user WebSocket managers
 let marketCache = { data: null, ts: 0 };
 let isProcessingBalance = false;
 let healthCheckInterval = null;
 let balanceCheckDebounceTimer = null;
 let pendingAnalysisQueue = new Set();
 
-// --- Job Status Tracker ---
+// --- Job Status Tracker (Global, but per-user jobs) ---
 const jobStatus = {
     lastPriceMovementCheck: 0,
     lastRecommendationScan: 0,
@@ -211,28 +214,47 @@ async function saveUserConfig(userId, id, data) {
 }
 
 async function getUserAPIConfig(userId) {
-    const encryptedKeys = await getUserConfig(userId, "api_keys", {});
-    if (!encryptedKeys.apiKey || !encryptedKeys.apiSecret || !encryptedKeys.passphrase) {
+    const encryptedData = await getUserConfig(userId, "api_keys", {});
+    if (!encryptedData.apiKey || !encryptedData.iv) {
         return null;
     }
-    // Decrypt keys
-    const decipher = crypto.createDecipher('aes-256-cbc', ENCRYPTION_KEY);
-    const apiKey = decipher.update(encryptedKeys.apiKey, 'hex', 'utf8') + decipher.final('utf8');
-    const apiSecret = decipher.update(encryptedKeys.apiSecret, 'hex', 'utf8') + decipher.final('utf8');
-    const passphrase = decipher.update(encryptedKeys.passphrase, 'hex', 'utf8') + decipher.final('utf8');
+    // Decrypt keys using stored IV
+    const iv = Buffer.from(encryptedData.iv, 'hex');
+    const decipher = crypto.createDecipheriv('aes-256-cbc', ENCRYPTION_KEY, iv);
+    let apiKey = decipher.update(encryptedData.apiKey, 'hex', 'utf8');
+    apiKey += decipher.final('utf8');
+    let apiSecret = decipher.update(encryptedData.apiSecret, 'hex', 'utf8');
+    apiSecret += decipher.final('utf8');
+    let passphrase = decipher.update(encryptedData.passphrase, 'hex', 'utf8');
+    passphrase += decipher.final('utf8');
     return { apiKey, apiSecret, passphrase };
 }
 
 async function saveUserAPIKeys(userId, apiKey, apiSecret, passphrase) {
-    // Encrypt keys
-    const cipher = crypto.createCipher('aes-256-cbc', ENCRYPTION_KEY);
-    const encryptedApiKey = cipher.update(apiKey, 'utf8', 'hex') + cipher.final('hex');
-    const encryptedApiSecret = cipher.update(apiSecret, 'utf8', 'hex') + cipher.final('hex');
-    const encryptedPassphrase = cipher.update(passphrase, 'utf8', 'hex') + cipher.final('hex');
-    await saveUserConfig(userId, "api_keys", { apiKey: encryptedApiKey, apiSecret: encryptedApiSecret, passphrase: encryptedPassphrase });
+    // Generate random IV for this encryption
+    const iv = crypto.randomBytes(16);
+    const cipher = crypto.createCipheriv('aes-256-cbc', ENCRYPTION_KEY, iv);
+    let encryptedApiKey = cipher.update(apiKey, 'utf8', 'hex');
+    encryptedApiKey += cipher.final('hex');
+    let encryptedApiSecret = cipher.update(apiSecret, 'utf8', 'hex');
+    encryptedApiSecret += cipher.final('hex');
+    let encryptedPassphrase = cipher.update(passphrase, 'utf8', 'hex');
+    encryptedPassphrase += cipher.final('hex');
+    await saveUserConfig(userId, "api_keys", { 
+        apiKey: encryptedApiKey, 
+        apiSecret: encryptedApiSecret, 
+        passphrase: encryptedPassphrase,
+        iv: iv.toString('hex')
+    });
 }
 
 async function deleteUserAPIKeys(userId) {
+    // Stop WS if active
+    const manager = wsManagers.get(userId);
+    if (manager) {
+        manager.close();
+        wsManagers.delete(userId);
+    }
     await saveUserConfig(userId, "api_keys", {});
 }
 
@@ -1445,13 +1467,6 @@ async function monitorBalanceChangesForUser(userId) {
     }
 }
 
-async function monitorBalanceChanges() {
-    const users = await getRegisteredUsers();
-    for (const userId of users) {
-        await monitorBalanceChangesForUser(userId);
-    }
-}
-
 async function trackPositionHighLow(userId) {
     jobStatus.lastPositionTrack = Date.now();
     try {
@@ -1785,16 +1800,16 @@ bot.command("start", async (ctx) => {
     await ctx.reply(welcomeMessage, { parse_mode: "MarkdownV2", reply_markup: replyMarkup });
 });
 
-// --- Text Message Handler ---
+// --- Unified Text Message Handler ---
 bot.on("message:text", async (ctx) => {
     const userId = ctx.userId;
     const text = ctx.message.text.trim();
     if (text.startsWith('/')) return;
 
-    if (waitingState && waitingState.userId === userId) {
-        const state = waitingState;
-        waitingState = null;
-        await handleWaitingState(ctx, state, text);
+    // Check for conversation state first
+    const conversation = userStates.get(userId);
+    if (conversation) {
+        await conversation.handle(ctx, text);
         return;
     }
 
@@ -1813,51 +1828,56 @@ bot.on("callback_query:data", async (ctx) => {
     await handleCallbackQuery(ctx, data, userId);
 });
 
-// --- API Key Linking Handlers ---
-bot.callbackQuery("link_okx_account", async (ctx) => {
-    const userId = ctx.userId;
-    waitingState = { userId, step: 'waiting_api_key', tempData: {} };
-    await ctx.editMessageText("🔑 *خطوة 1/3: أرسل مفتاح API Key الخاص بك\\.*\n\n*ملاحظة: سيتم حذف رسالتك فورًا للأمان\\.*", { parse_mode: "MarkdownV2" });
-});
+// --- API Key Linking with Conversations ---
+async function linkOKXConversation(conversation, ctx) {
+    await ctx.reply("🔑 *خطوة 1/3: أرسل مفتاح API Key الخاص بك\\.*\n\n*ملاحظة: سيتم حذف رسالتك فورًا للأمان\\.*", { parse_mode: "MarkdownV2" });
 
-bot.on("message:text", async (ctx) => {
-    const userId = ctx.userId;
-    if (waitingState && waitingState.userId === userId && waitingState.step === 'waiting_api_key') {
+    await conversation.waitFor("message:text", async (ctx) => {
         const apiKey = ctx.message.text.trim();
-        await ctx.deleteMessage(); // Delete user message for security
-        waitingState.tempData.apiKey = apiKey;
-        waitingState.step = 'waiting_api_secret';
+        await ctx.deleteMessage(); // Delete for security
+        conversation.tempData = { apiKey };
         await ctx.reply("🔑 *خطوة 2/3: أرسل API Secret\\.*", { parse_mode: "MarkdownV2" });
-        return;
-    }
-    if (waitingState && waitingState.userId === userId && waitingState.step === 'waiting_api_secret') {
+    });
+
+    await conversation.waitFor("message:text", async (ctx) => {
         const apiSecret = ctx.message.text.trim();
         await ctx.deleteMessage();
-        waitingState.tempData.apiSecret = apiSecret;
-        waitingState.step = 'waiting_passphrase';
+        conversation.tempData.apiSecret = apiSecret;
         await ctx.reply("🔑 *خطوة 3/3: أرسل Passphrase\\.*", { parse_mode: "MarkdownV2" });
-        return;
-    }
-    if (waitingState && waitingState.userId === userId && waitingState.step === 'waiting_passphrase') {
+    });
+
+    await conversation.waitFor("message:text", async (ctx) => {
         const passphrase = ctx.message.text.trim();
         await ctx.deleteMessage();
-        waitingState.tempData.passphrase = passphrase;
+        conversation.tempData.passphrase = passphrase;
+
         // Verify
-        const tempAdapter = new OKXAdapter({ ...waitingState.tempData });
+        const tempAdapter = new OKXAdapter(conversation.tempData);
         const prices = await getCachedMarketPrices();
         const { error } = await tempAdapter.getPortfolio(prices);
+
         if (error) {
             const retryKeyboard = new InlineKeyboard().text("🔄 حاول مرة أخرى", "link_okx_account");
             await ctx.reply("❌ *المفاتيح التي أدخلتها غير صحيحة\\. يرجى التأكد منها\\.*", { reply_markup: retryKeyboard, parse_mode: "MarkdownV2" });
         } else {
-            await saveUserAPIKeys(userId, waitingState.tempData.apiKey, waitingState.tempData.apiSecret, waitingState.tempData.passphrase);
-            const mainKeyboardWithSettings = mainKeyboard;
+            const userId = ctx.from.id;
+            await saveUserAPIKeys(userId, conversation.tempData.apiKey, conversation.tempData.apiSecret, conversation.tempData.passphrase);
+            // Start private WS
+            const config = await getUserAPIConfig(userId);
+            const manager = new PrivateWebSocketManager(userId, config);
+            wsManagers.set(userId, manager);
+            manager.connect();
             await ctx.reply("✅ *تم الربط بنجاح\\!* الآن يمكنك استخدام جميع الميزات\\.", { reply_markup: mainKeyboard, parse_mode: "MarkdownV2" });
-            ctx.hasKeys = true; // Update context
         }
-        waitingState = null;
-        return;
-    }
+        userStates.delete(userId);
+    });
+}
+
+bot.callbackQuery("link_okx_account", async (ctx) => {
+    const userId = ctx.userId;
+    const conversation = createConversation(linkOKXConversation);
+    userStates.set(userId, conversation);
+    await conversation.enter(ctx);
 });
 
 // Other handlers remain similar, but pass userId and use per-user functions
@@ -1929,8 +1949,10 @@ async function startBot() {
         await connectDB();
         console.log("MongoDB connected successfully.");
 
-        // 2. Start all background jobs (now multi-tenant)
-        console.log("Starting OKX background jobs for all users...");
+        // 2. Start distributed background jobs
+        console.log("Starting distributed OKX background jobs for all users...");
+
+        // High-frequency jobs (every 1 min)
         setInterval(async () => {
             const users = await getRegisteredUsers();
             for (const userId of users) {
@@ -1941,12 +1963,30 @@ async function startBot() {
                 await runHourlyJobs(userId);
                 await scanForSetups(userId);
                 await processAnalysisQueue(userId);
+                // Delay between users to avoid API flooding
+                await new Promise(resolve => setTimeout(resolve, 200));
+            }
+        }, 60000);
+
+        // Medium-frequency jobs (every 5 min)
+        setInterval(async () => {
+            const users = await getRegisteredUsers();
+            for (const userId of users) {
+                await checkTechnicalPatterns(userId);
+                await new Promise(resolve => setTimeout(resolve, 200));
+            }
+        }, 5 * 60000);
+
+        // Low-frequency jobs (every hour)
+        setInterval(async () => {
+            const users = await getRegisteredUsers();
+            for (const userId of users) {
                 await runDailyJobs(userId);
                 await runDailyReportJob(userId);
                 await createBackup(userId);
-                await checkTechnicalPatterns(userId);
+                await new Promise(resolve => setTimeout(resolve, 200));
             }
-        }, 60000); // Run every minute for all users
+        }, 60 * 60000);
 
         console.log("Running initial jobs on startup...");
         const users = await getRegisteredUsers();
@@ -1955,11 +1995,12 @@ async function startBot() {
             await runDailyJobs(userId);
         }
 
-        // Start real-time monitoring for all users (WebSocket per user if needed, but shared for market data)
+        // Start public WS for market data
+        connectToOKXSocket();
 
         // Send startup message to authorized user if exists
         if (process.env.AUTHORIZED_USER_ID) {
-            await bot.api.sendMessage(parseInt(process.env.AUTHORIZED_USER_ID), "✅ *تم تشغيل البوت بنجاح (وضع Multi-Tenant)*", { parse_mode: "MarkdownV2" }).catch(console.error);
+            await bot.api.sendMessage(parseInt(process.env.AUTHORIZED_USER_ID), "✅ *تم تشغيل البوت بنجاح (وضع Multi-Tenant مع WebSocket)*", { parse_mode: "MarkdownV2" }).catch(console.error);
         }
 
         // 3. Finally, start the bot
@@ -1975,10 +2016,11 @@ async function startBot() {
 }
 
 // =================================================================
-// SECTION 9: WEBSOCKET MANAGER (Shared for Market, Per-User for Private if Needed)
+// SECTION 9: WEBSOCKET MANAGER (Public + Private Per-User)
 // =================================================================
+
 function connectToOKXSocket() {
-    const ws = new WebSocket('wss://ws.okx.com:8443/ws/v5/public'); // Public for market, private per user if needed
+    const ws = new WebSocket('wss://ws.okx.com:8443/ws/v5/public'); // Public for market
 
     ws.on('open', () => {
         console.log("OKX Public WebSocket Connected! Subscribing to tickers...");
@@ -2029,5 +2071,104 @@ function connectToOKXSocket() {
     });
 }
 
+class PrivateWebSocketManager {
+    constructor(userId, config) {
+        this.userId = userId;
+        this.config = config;
+        this.ws = null;
+        this.reconnectTimer = null;
+        this.pingInterval = null;
+    }
+
+    getHeaders() {
+        const timestamp = new Date().toISOString();
+        const sign = crypto.createHmac("sha256", this.config.apiSecret).update(timestamp + 'GET' + '/users/self/verify').digest("base64");
+        return {
+            "OK-ACCESS-KEY": this.config.apiKey,
+            "OK-ACCESS-SIGN": sign,
+            "OK-ACCESS-TIMESTAMP": timestamp,
+            "OK-ACCESS-PASSPHRASE": this.config.passphrase,
+            "Content-Type": "application/json",
+        };
+    }
+
+    connect() {
+        this.ws = new WebSocket('wss://ws.okx.com:8443/ws/v5/private');
+
+        this.ws.on('open', () => {
+            console.log(`Private WS for user ${this.userId} connected. Logging in...`);
+            // Login
+            const loginMsg = {
+                op: "login",
+                args: [{
+                    apiKey: this.config.apiKey,
+                    passphrase: this.config.passphrase,
+                    timestamp: new Date().toISOString(),
+                    sign: crypto.createHmac("sha256", this.config.apiSecret).update(new Date().toISOString() + 'GET' + '/users/self/verify').digest("base64")
+                }]
+            };
+            this.ws.send(JSON.stringify(loginMsg));
+
+            // Subscribe to account channel
+            const subscribeMsg = {
+                op: "subscribe",
+                args: [{
+                    channel: "account",
+                    instType: "SPOT"
+                }]
+            };
+            this.ws.send(JSON.stringify(subscribeMsg));
+
+            this.startPing();
+        });
+
+        this.ws.on('message', async (data) => {
+            const rawData = data.toString();
+            if (rawData === 'pong') return;
+
+            try {
+                const message = JSON.parse(rawData);
+                if (message.arg && message.arg.channel === 'account') {
+                    // Balance change detected - trigger immediate check
+                    console.log(`Balance update for user ${this.userId} via WS`);
+                    await monitorBalanceChangesForUser(this.userId);
+                }
+            } catch (error) {
+                console.error(`Private WS error for user ${this.userId}:`, error);
+            }
+        });
+
+        this.ws.on('close', () => {
+            console.log(`Private WS for user ${this.userId} closed. Reconnecting...`);
+            this.stopPing();
+            this.reconnectTimer = setTimeout(() => this.connect(), 5000);
+        });
+
+        this.ws.on('error', (err) => {
+            console.error(`Private WS error for user ${this.userId}:`, err);
+        });
+    }
+
+    startPing() {
+        this.pingInterval = setInterval(() => {
+            if (this.ws.readyState === WebSocket.OPEN) {
+                this.ws.send('ping');
+            }
+        }, 25000);
+    }
+
+    stopPing() {
+        if (this.pingInterval) {
+            clearInterval(this.pingInterval);
+            this.pingInterval = null;
+        }
+    }
+
+    close() {
+        if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+        this.stopPing();
+        if (this.ws) this.ws.close();
+    }
+}
 
 startBot();
