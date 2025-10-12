@@ -44,10 +44,7 @@ let isProcessingBalance = false;
 let healthCheckInterval = null;
 let balanceCheckDebounceTimer = null;
 let pendingAnalysisQueue = new Set();
-let isProcessingBalance = false;
-let healthCheckInterval = null;
-let balanceCheckDebounceTimer = null;
-let pendingAnalysisQueue = new Set();
+
 
 // --- Job Status Tracker (Global, but per-user jobs) ---
 const jobStatus = {
