@@ -2,333 +2,350 @@ import uvicorn
 import asyncio
 import logging
 import os
-import aiohttp
-from fastapi import FastAPI, Request, Depends, HTTPException, WebSocket, Body
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from typing import Dict, Any, List
+import ccxt.async_support as ccxt
+from fastapi import FastAPI, Request, Depends, HTTPException, WebSocket, Body, Header
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from typing import Dict, Any, List, Optional
 from uuid import UUID
+from contextlib import asynccontextmanager
 
+# --- استيراد الوحدات الجديدة ---
 import db_utils
-import core_logic
-from db_utils import UserKeys
+from db_utils import UserKeys, TradingVariables
 
 # --- إعداد FastAPI ---
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-logger = logging.getLogger("FastAPIServer")
+logger = logging.getLogger("FastAPIServer_V2")
 
-app = FastAPI(title="Trading Bot SaaS Platform")
-
-# --- إعداد CORS (للسماح لواجهة الويب بالتحدث مع الخادم) ---
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], # في الإنتاج، يجب تقييد هذا
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="Trading Bot SaaS Platform (V2)")
 
 # --- (تنفيذ المطلب: التخزين المؤقت للاتصالات) ---
-# (هذا كان مطلبًا في التحدي الأصلي)
 USER_CCXT_CACHE: Dict[UUID, ccxt.Exchange] = {}
 CCXT_CACHE_LOCK = asyncio.Lock()
 
-class CCXTConnectionManager:
-    """يدير اتصالات CCXT المخبأة لجلب الأرصدة بسرعة."""
+@asynccontextmanager
+async def get_ccxt_connection(user_id: UUID) -> ccxt.Exchange:
+    """
+    يدير اتصالات CCXT المخبأة لجلب الأرصدة بسرعة.
+    [cite: 570] (يحاكي CCXTConnectionManager)
+    """
+    async with CCXT_CACHE_LOCK:
+        if user_id in USER_CCXT_CACHE:
+            logger.info(f"API: Using cached CCXT connection for user {user_id}")
+            yield USER_CCXT_CACHE[user_id]
+            return
     
-    async def get_connection(self, user_id: UUID) -> ccxt.Exchange:
+    logger.info(f"API: Creating new CCXT connection for user {user_id}...")
+    keys = await db_utils.get_user_api_keys(user_id)
+    if not keys:
+        raise HTTPException(status_code=404, detail="User API keys not found or invalid. Please set them first.")
+        
+    exchange = None
+    try:
+        exchange = ccxt.binance({
+            'apiKey': keys.api_key,
+            'secret': keys.api_secret,
+            'enableRateLimit': True,
+            'options': {'defaultType': 'spot'}
+        })
+        await exchange.load_markets()
+        
+        async with CCXT_CACHE_LOCK:
+            USER_CCXT_CACHE[user_id] = exchange
+            
+        yield exchange
+    
+    except Exception as e:
+        logger.error(f"API: Failed to create CCXT connection for {user_id}: {e}")
+        # حذف المفتاح من الذاكرة المؤقتة إذا فشل
         async with CCXT_CACHE_LOCK:
             if user_id in USER_CCXT_CACHE:
-                logger.info(f"API: Using cached CCXT connection for user {user_id}")
-                return USER_CCXT_CACHE[user_id]
-            
-            logger.info(f"API: Creating new CCXT connection for user {user_id}...")
-            keys = await db_utils.get_user_api_keys(user_id)
-            if not keys:
-                raise HTTPException(status_code=404, detail="User API keys not found or invalid.")
-                
-            try:
-                exchange = ccxt.binance({
-                    'apiKey': keys.api_key,
-                    'secret': keys.api_secret,
-                    'enableRateLimit': True,
-                    'options': {'defaultType': 'spot'}
-                })
-                await exchange.load_markets()
-                USER_CCXT_CACHE[user_id] = exchange
-                return exchange
-            except Exception as e:
-                logger.error(f"API: Failed to create CCXT connection for {user_id}: {e}")
-                raise HTTPException(status_code=500, detail="Failed to initialize exchange connection.")
+                del USER_CCXT_CACHE[user_id]
+        raise HTTPException(status_code=500, detail=f"Failed to initialize exchange connection: {str(e)}")
+    finally:
+        # (لا نغلق الاتصال هنا، سيبقى في الذاكرة المؤقتة)
+        pass
 
-    async def close_all_connections(self):
-        async with CCXT_CACHE_LOCK:
-            logger.info("API: Closing all cached CCXT connections...")
-            for exchange in USER_CCXT_CACHE.values():
-                await exchange.close()
-            USER_CCXT_CACHE.clear()
+async def close_all_cached_connections():
+    async with CCXT_CACHE_LOCK:
+        logger.info("API: Closing all cached CCXT connections...")
+        for exchange in USER_CCXT_CACHE.values():
+            await exchange.close()
+        USER_CCXT_CACHE.clear()
 
-ccxt_manager = CCXTConnectionManager()
+# --- المصادقة (مطابقة لـ api.ts) ---
 
-# --- المصادقة (محاكاة) ---
-# هذه الدالة ستبحث عن المستخدم بناءً على رقم الدردشة في تليجرام
-async def get_current_user(request: Request) -> UUID:
+async def get_current_user(authorization: str = Header(None)) -> UUID:
     """
-    محاكاة جلب المستخدم. في الإنتاج، سيفك تشفير JWT.
-    هنا، نستخدم رأس 'X-Telegram-Chat-Id' وهمي.
+    (يحاكي api.ts)
+    يتحقق من رأس 'Authorization: Bearer <token>'
+    في هذه البنية، الـ token هو نفسه الـ user_id من Supabase.
     """
-    chat_id_str = request.headers.get("X-Telegram-Chat-Id")
-    if not chat_id_str:
-        raise HTTPException(status_code=401, detail="Unauthorized: X-Telegram-Chat-Id header missing.")
+    if authorization is None:
+        raise HTTPException(status_code=401, detail="Authorization header missing.")
     
     try:
-        chat_id = int(chat_id_str)
-        user_id = await db_utils.get_user_by_telegram_id(chat_id)
-        if not user_id:
-            raise HTTPException(status_code=404, detail="User not found for this Telegram ID.")
-        return user_id
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid Telegram Chat ID format.")
+        token_type, token = authorization.split(" ")
+        if token_type.lower() != "bearer":
+            raise ValueError("Invalid token type")
+        
+        # الـ Token هو user_id
+        user_uuid = UUID(token)
+        return user_uuid
+    except (ValueError, TypeError) as e:
+        logger.warning(f"Auth Error: Invalid token format. {e}")
+        raise HTTPException(status_code=401, detail="Invalid authorization token.")
 
 # =======================================================================================
 # --- واجهات برمجة التطبيقات (API Endpoints) ---
-# تم تصميمها لتحاكي كل الأزرار في BN.py
+# (مطابقة تماماً لـ api.ts)
 # =======================================================================================
 
-# --- 1. مسارات لوحة التحكم (Dashboard) ---
+# --- 1. Bot Control  ---
 
-@app.get("/api/dashboard/portfolio")
-async def get_portfolio(user_id: UUID = Depends(get_current_user)):
-    """(يحاكي show_portfolio_command) يجلب نظرة عامة على المحفظة."""
+@app.post("/bot/start", tags=["Bot Control"])
+async def start_bot(user_id: UUID = Depends(get_current_user)):
+    """(ينفذ /bot/start)  - يشغل البوت للمستخدم."""
+    logger.info(f"API: User {user_id} requested START")
+    settings = await db_utils.set_bot_status(user_id, True)
+    return {"status": "starting", "is_running": settings.is_running}
+
+@app.post("/bot/stop", tags=["Bot Control"])
+async def stop_bot(user_id: UUID = Depends(get_current_user)):
+    """(ينفذ /bot/stop)  - يوقف البوت للمستخدم."""
+    logger.info(f"API: User {user_id} requested STOP")
+    settings = await db_utils.set_bot_status(user_id, False)
+    return {"status": "stopping", "is_running": settings.is_running}
+
+@app.get("/bot/status", tags=["Bot Control"])
+async def get_bot_status(user_id: UUID = Depends(get_current_user)):
+    """(ينفذ /bot/status)  - يجلب حالة البوت الحالية."""
+    logger.debug(f"API: User {user_id} requested status")
+    settings = await db_utils.get_bot_status(user_id)
+    return {"status": "running" if settings.is_running else "offline", "is_running": settings.is_running}
+
+# --- 2. Balance & Keys [cite: 62-64] ---
+
+@app.get("/bot/balance", tags=["Balance & Keys"])
+async def get_balance(user_id: UUID = Depends(get_current_user)):
+    """(ينفذ /bot/balance)  - يجلب الرصيد الفعلي من Binance."""
     try:
-        exchange = await ccxt_manager.get_connection(user_id)
-        balance = await exchange.fetch_balance()
-        
-        owned_assets = {
-            asset: data['total'] for asset, data in balance.items() 
-            if isinstance(data, dict) and data.get('total', 0) > 0 and 'USDT' not in asset
-        }
-        usdt_balance = balance.get('USDT', {})
-        
-        # (يمكن إضافة منطق جلب أسعار الأصول الأخرى هنا...)
-        
-        stats = await db_utils.get_user_overall_stats(user_id)
-        active_count = await db_utils.get_active_trade_count_for_user(user_id)
-
-        return {
-            "total_usdt_equity": usdt_balance.get('total', 0),
-            "free_usdt": usdt_balance.get('free', 0),
-            "owned_assets_count": len(owned_assets),
-            "total_realized_pnl": stats.get('total_pnl', 0),
-            "active_trades_count": active_count
-        }
+        async with get_ccxt_connection(user_id) as exchange:
+            balance = await exchange.fetch_balance()
+            usdt_balance = balance.get('USDT', {})
+            return {
+                "total_balance": usdt_balance.get('total', 0),
+                "available_balance": usdt_balance.get('free', 0),
+                "currency": "USDT"
+            }
+    except HTTPException as e:
+        raise e # إعادة إرسال أخطاء 404 أو 500
     except Exception as e:
-        logger.error(f"API /portfolio error: {e}", exc_info=True)
+        logger.error(f"API /balance error for user {user_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/api/dashboard/active_trades")
+class KeysPayload(BaseModel):
+    api_key: str
+    secret_key: str
+    passphrase: Optional[str] = None
+
+@app.post("/bot/test-keys", tags=["Balance & Keys"])
+async def test_binance_keys(payload: KeysPayload, user_id: UUID = Depends(get_current_user)):
+    """(ينفذ /bot/test-keys)  - يختبر المفاتيح قبل الحفظ."""
+    logger.info(f"API: User {user_id} testing keys...")
+    try:
+        # إنشاء اتصال مؤقت للاختبار فقط
+        test_exchange = ccxt.binance({
+            'apiKey': payload.api_key,
+            'secret': payload.secret_key,
+            'enableRateLimit': True,
+        })
+        await test_exchange.fetch_balance()
+        await test_exchange.close()
+        
+        # إذا نجح الاختبار، قم بحفظ المفاتيح
+        await db_utils.save_api_keys(user_id, payload.api_key, payload.secret_key, payload.passphrase)
+        await db_utils.set_api_keys_valid(user_id, True)
+        
+        return {"status": "success", "message": "تم اختبار وحفظ المفاتيح بنجاح."}
+    except Exception as e:
+        logger.error(f"API /test-keys error for user {user_id}: {e}")
+        await db_utils.set_api_keys_valid(user_id, False) # وضع علامة "غير صالح"
+        raise HTTPException(status_code=400, detail=f"فشل اختبار المفاتيح: {str(e)}")
+
+@app.post("/keys", tags=["Balance & Keys"])
+async def save_binance_keys(payload: KeysPayload, user_id: UUID = Depends(get_current_user)):
+    """(ينفذ /keys) - يحفظ المفاتيح (يستخدمه /bot/test-keys)."""
+    logger.info(f"API: User {user_id} saving keys...")
+    success = await db_utils.save_api_keys(user_id, payload.api_key, payload.secret_key, payload.passphrase)
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to save keys to database.")
+    return {"status": "success", "message": "تم حفظ المفاتيح (في انتظار الاختبار)."}
+
+# --- 3. Trades  ---
+
+@app.get("/trades/active", tags=["Trades"])
 async def get_active_trades(user_id: UUID = Depends(get_current_user)):
-    """(يحاكي show_trades_command) يجلب الصفقات النشطة."""
-    trades = await db_utils.get_dashboard_trades_for_user(user_id)
+    """(ينفذ /trades/active) [cite: 65] - يجلب الصفقات النشطة."""
+    trades = await db_utils.get_active_trades(user_id)
     return trades
 
-@app.get("/api/dashboard/trade_history")
-async def get_trade_history(user_id: UUID = Depends(get_current_user)):
-    """(يحاكي show_trade_history_command) يجلب آخر 10 صفقات."""
-    history = await db_utils.get_trade_history_for_user(user_id, limit=10)
+class CloseTradePayload(BaseModel):
+    trade_id: int
+
+@app.post("/trades/close", tags=["Trades"])
+async def close_trade(payload: CloseTradePayload, user_id: UUID = Depends(get_current_user)):
+    """(ينفذ /trades/close) [cite: 65] - يطلب إغلاق صفقة."""
+    logger.info(f"API: User {user_id} requested manual close for trade #{payload.trade_id}.")
+    success = await db_utils.flag_trade_for_closure(user_id, payload.trade_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Trade not found or not active.")
+    return {"status": "closing", "message": "تم إرسال أمر الإغلاق إلى العامل."}
+
+@app.get("/trades/history", tags=["Trades"])
+async def get_trades_history(limit: int = 50, user_id: UUID = Depends(get_current_user)):
+    """(ينفذ /trades/history) [cite: 65] - يجلب سجل الصفقات."""
+    history = await db_utils.get_trades_history(user_id, limit)
     return history
 
-@app.get("/api/dashboard/stats")
-async def get_stats(user_id: UUID = Depends(get_current_user)):
-    """(يحاكي show_stats_command) يجلب الإحصائيات العامة."""
-    stats = await db_utils.get_user_overall_stats(user_id)
+@app.get("/trades/stats", tags=["Trades"])
+async def get_trades_stats(user_id: UUID = Depends(get_current_user)):
+    """(ينفذ /trades/stats) [cite: 66] - يجلب الإحصائيات."""
+    stats = await db_utils.get_trades_stats(user_id)
     return stats
 
-@app.get("/api/dashboard/strategy_report")
-async def get_strategy_report(user_id: UUID = Depends(get_current_user)):
-    """(يحاكي show_strategy_report_command) يجلب أداء الاستراتيجيات."""
-    report = await db_utils.get_user_strategy_performance(user_id, limit=100)
-    return report
+# --- 4. Strategies (Scanners) [cite: 67, 70] ---
+# هذه المسارات تتعامل مع جدول "strategies" الذي تتحكم به الواجهة
 
-@app.get("/api/dashboard/mood")
-async def get_market_mood(user_id: UUID = Depends(get_current_user)):
-    """(يحاكي show_mood_command) يجلب مزاج السوق."""
-    # هذا المنطق يعتمد على واجهات خارجية، سنقوم بمحاكاته
-    # (يجب نقل منطق get_fear_and_greed_index, get_market_mood... إلخ إلى هنا)
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get("https://api.alternative.me/fng/?limit=1") as resp:
-                fng_data = await resp.json()
-                fng_index = int(fng_data['data'][0]['value'])
-        
-        # (يجب إضافة منطق BTC Trend و News Sentiment هنا)
-        
-        return {
-            "verdict": "المؤشرات إيجابية، لكن بحذر.",
-            "btc_mood": "صاعد ✅",
-            "fng_index": fng_index,
-            "news_sentiment": "محايدة"
-        }
-    except Exception as e:
-        logger.error(f"API /mood error: {e}")
-        return {"verdict": "فشل جلب بيانات المزاج", "fng_index": "N/A"}
+@app.get("/strategies", tags=["Strategies & Scanners"])
+async def get_strategies(user_id: UUID = Depends(get_current_user)):
+    """(ينفذ /strategies) [cite: 67] - يجلب قائمة الاستراتيجيات من Supabase."""
+    # (هذا مطابق لـ Scanners.tsx)
+    async with db_utils.db_connection() as conn:
+        records = await conn.fetch("SELECT * FROM strategies WHERE user_id = $1", user_id)
+    return [dict(r) for r in records]
 
-@app.get("/api/dashboard/daily_report")
-async def get_daily_report(user_id: UUID = Depends(get_current_user)):
-    """(يحاكي daily_report_command) يجلب تقرير اليوم."""
-    report = await db_utils.get_user_daily_report(user_id)
-    return report
+@app.post("/strategies/{strategy_name}/toggle", tags=["Strategies & Scanners"])
+async def toggle_strategy(strategy_name: str, enabled_payload: dict = Body(...), user_id: UUID = Depends(get_current_user)):
+    """(ينفذ /strategies/{name}/toggle) [cite: 67] - يفعل/يعطل استراتيجية."""
+    is_enabled = enabled_payload.get('enabled', False)
+    logger.info(f"API: User {user_id} setting strategy {strategy_name} to {is_enabled}")
+    async with db_utils.db_connection() as conn:
+        await conn.execute(
+            "UPDATE strategies SET is_enabled = $1 WHERE user_id = $2 AND strategy_name = $3",
+            is_enabled, user_id, strategy_name
+        )
+    return {"status": "success", "strategy_name": strategy_name, "is_enabled": is_enabled}
 
-# --- 2. مسارات الإجراءات (Actions) ---
+# (المسارات /scanners هي نفسها /strategies في هذا العقد)
+@app.get("/scanners", tags=["Strategies & Scanners"])
+async def get_scanners(user_id: UUID = Depends(get_current_user)):
+    """(ينفذ /scanners) [cite: 70]"""
+    return await get_strategies(user_id)
 
-@app.post("/api/actions/toggle_kill_switch")
-async def toggle_kill_switch(user_id: UUID = Depends(get_current_user)):
-    """(يحاكي toggle_kill_switch) يبدل حالة التداول."""
-    settings = await db_utils.get_user_settings(user_id)
-    new_status = not settings.is_trading_enabled
-    await db_utils.update_user_settings(user_id, {"is_trading_enabled": new_status})
-    return {"new_status": new_status}
+@app.post("/scanners/{scanner_name}/toggle", tags=["Strategies & Scanners"])
+async def toggle_scanner(scanner_name: str, enabled_payload: dict = Body(...), user_id: UUID = Depends(get_current_user)):
+    """(ينفذ /scanners/{name}/toggle) [cite: 70]"""
+    return await toggle_strategy(scanner_name, enabled_payload, user_id)
 
-@app.post("/api/actions/manual_scan")
-async def trigger_manual_scan(user_id: UUID = Depends(get_current_user)):
-    """(يحاكي manual_scan_command) يطلب فحصاً فورياً."""
-    # ملاحظة: هذا لا يشغل الفحص مباشرة.
-    # في البنية الجديدة، يمكننا إضافة "علم" في قاعدة البيانات
-    # ليقوم العامل (Worker) بالتقاطه.
-    logger.info(f"API: Manual scan requested by user {user_id}. (Note: Worker picks this up on its own schedule)")
-    # (تحتاج إضافة حقل force_scan في جدول user_settings)
-    # await db_utils.update_user_settings(user_id, {"force_scan_request": True})
-    return {"message": "تم إرسال طلب الفحص إلى العامل."}
+# --- 5. Settings & Presets [cite: 68-69] ---
 
-# --- 3. مسارات إدارة الصفقات ---
-
-@app.get("/api/trades/{trade_id}")
-async def get_trade_details(trade_id: int, user_id: UUID = Depends(get_current_user)):
-    """(يحاكي check_trade_details) يجلب تفاصيل صفقة."""
-    trade = await db_utils.get_trade_details_for_user(user_id, trade_id)
-    if not trade:
-        raise HTTPException(status_code=404, detail="Trade not found or does not belong to user.")
-    
-    # جلب السعر الحالي
-    try:
-        ticker = await PUBLIC_EXCHANGE.fetch_ticker(trade['symbol'])
-        current_price = ticker['last']
-        pnl = (current_price - trade['entry_price']) * trade['quantity']
-        pnl_percent = (current_price / trade['entry_price'] - 1) * 100 if trade['entry_price'] > 0 else 0
-        trade_with_pnl = dict(trade)
-        trade_with_pnl['current_price'] = current_price
-        trade_with_pnl['pnl_usdt_live'] = pnl
-        trade_with_pnl['pnl_percent_live'] = pnl_percent
-        return trade_with_pnl
-    except Exception:
-        return trade # إرجاع الصفقة بدون بيانات حية إذا فشل
-
-@app.post("/api/trades/{trade_id}/manual_sell")
-async def manual_sell_trade(trade_id: int, user_id: UUID = Depends(get_current_user)):
-    """(يحاكي handle_manual_sell_execute) يبيع صفقة يدوياً."""
-    logger.info(f"API: User {user_id} requested manual sell for trade #{trade_id}.")
-    trade = await db_utils.get_trade_details_for_user(user_id, trade_id)
-    if not trade:
-        raise HTTPException(status_code=404, detail="Trade not found.")
-    if trade['status'] != 'active':
-        raise HTTPException(status_code=400, detail="Trade is not active.")
-        
-    # لا نبيع من هنا. نرفع العلم للعامل.
-    await db_utils.set_trade_status(trade_id, "force_exit_manual")
-    return {"message": "تم إرسال أمر الإغلاق إلى العامل."}
-
-# --- 4. مسارات الإعدادات (Settings) ---
-
-class SettingsUpdatePayload(BaseModel):
-    # نموذج مرن لاستقبال أي تحديثات
-    updates: Dict[str, Any] = Field(..., example={"real_trade_size_usdt": 20.5, "trailing_sl_enabled": False})
-
-@app.get("/api/settings")
-async def get_all_settings(user_id: UUID = Depends(get_current_user)):
-    """(يحاكي show_settings_menu) يجلب كائن الإعدادات الكامل."""
-    settings = await db_utils.get_user_settings(user_id)
+@app.get("/settings", tags=["Settings & Presets"])
+async def get_bot_settings(user_id: UUID = Depends(get_current_user)):
+    """(ينفذ GET /settings)  - يجلب الإعدادات المتقدمة."""
+    settings = await db_utils.get_api_settings(user_id)
     if not settings:
-        raise HTTPException(status_code=404, detail="Settings not found for user.")
+        raise HTTPException(status_code=404, detail="Advanced variables not found for this user.")
     return settings
 
-@app.post("/api/settings")
-async def update_settings(payload: SettingsUpdatePayload, user_id: UUID = Depends(get_current_user)):
-    """
-    (يحاكي handle_setting_value و handle_toggle_parameter)
-    مسار واحد قوي لتحديث أي إعدادات.
-    """
-    logger.info(f"API: User {user_id} updating settings: {payload.updates}")
+@app.post("/settings", tags=["Settings & Presets"])
+async def update_bot_settings(settings: Dict[str, Any], user_id: UUID = Depends(get_current_user)):
+    """(ينفذ POST /settings)  - يحدّث الإعدادات المتقدمة."""
+    logger.info(f"API: User {user_id} updating advanced settings...")
+    # (إزالة الحقول التي لا يجب تحديثها)
+    settings.pop('id', None)
+    settings.pop('user_id', None)
+    settings.pop('updated_at', None)
     
-    # (يجب إضافة منطق للتحقق من صحة المدخلات هنا)
-    
-    success = await db_utils.update_user_settings(user_id, payload.updates)
+    success = await db_utils.update_api_settings(user_id, settings)
     if not success:
-        raise HTTPException(status_code=500, detail="Failed to update settings in database.")
+        raise HTTPException(status_code=500, detail="Failed to update settings.")
+    return {"status": "success", "message": "تم تحديث الإعدادات بنجاح."}
+
+class PresetPayload(BaseModel):
+    preset_name: str
+
+@app.post("/settings/preset", tags=["Settings & Presets"])
+async def change_preset(payload: PresetPayload, user_id: UUID = Depends(get_current_user)):
+    """(ينفذ /settings/preset)  - يطبق نمط جاهز."""
+    logger.info(f"API: User {user_id} applying preset '{payload.preset_name}'")
+    
+    # جلب تعريفات الأنماط (التي في Presets.tsx)
+    # 
+    preset_definitions = {
+        'strict': {"real_trade_size_usdt": 50, "max_concurrent_trades": 2, "risk_reward_ratio": 3.0, "max_daily_loss_pct": 2.0},
+        'professional': {"real_trade_size_usdt": 100, "max_concurrent_trades": 3, "risk_reward_ratio": 2.5, "max_daily_loss_pct": 3.0},
+        'lenient': {"real_trade_size_usdt": 150, "max_concurrent_trades": 5, "risk_reward_ratio": 2.0, "max_daily_loss_pct": 5.0},
+        'very_lenient': {"real_trade_size_usdt": 200, "max_concurrent_trades": 7, "risk_reward_ratio": 1.5, "max_daily_loss_pct": 7.0},
+        'bold_heart': {"real_trade_size_usdt": 300, "max_concurrent_trades": 10, "risk_reward_ratio": 1.2, "max_daily_loss_pct": 10.0}
+    }
+    
+    settings_to_apply = preset_definitions.get(payload.preset_name)
+    if not settings_to_apply:
+        raise HTTPException(status_code=404, detail="Preset not found.")
+    
+    # (هذه مجرد عينة، يجب نسخ كل الإعدادات من Presets.tsx)
+    # (يجب أيضاً تحديث `enabled_strategies` في جدول `strategies`)
+    
+    success = await db_utils.apply_preset_settings(user_id, payload.preset_name, settings_to_apply)
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to apply preset.")
         
-    # مسح ذاكرة التخزين المؤقت للإعدادات لهذا المستخدم في العامل
-    # (في البنية المتقدمة، نستخدم Redis Pub/Sub لإعلام العامل فوراً)
-    # (للبساطة، سيعتمد العامل على CACHE_SYNC_INTERVAL_SECONDS)
-    
-    return {"message": "Settings updated successfully.", "updated_fields": list(payload.updates.keys())}
+    return {"status": "success", "message": f"تم تطبيق نمط '{payload.preset_name}' بنجاح."}
 
-# --- 5. مسارات إدارة البيانات ---
+# --- 6. Notifications & Health [cite: 69-70] ---
 
-@app.delete("/api/data/clear_trades")
-async def clear_trades(user_id: UUID = Depends(get_current_user)):
-    """(يحاكي handle_clear_data_execute) يمسح سجل الصفقات."""
-    logger.warning(f"API: User {user_id} is clearing all trade data.")
-    success = await db_utils.clear_user_trades(user_id)
+@app.get("/notifications", tags=["Notifications & Health"])
+async def get_notifications(limit: int = 50, unread_only: bool = False, user_id: UUID = Depends(get_current_user)):
+    """(ينفذ /notifications) - يجلب الإشعارات."""
+    notifications = await db_utils.get_notifications(user_id, limit, unread_only)
+    return notifications
+
+@app.post("/notifications/{notification_id}/read", tags=["Notifications & Health"])
+async def mark_notification_read(notification_id: int, user_id: UUID = Depends(get_current_user)):
+    """(ينفذ /notifications/{id}/read) [cite: 13-14] - يضع علامة "مقروء"."""
+    success = await db_utils.mark_notification_read(user_id, notification_id)
     if not success:
-        raise HTTPException(status_code=500, detail="Failed to clear trade data.")
-    return {"message": "تم حذف جميع بيانات الصفقات والسجل التحليلي."}
+        raise HTTPException(status_code=404, detail="Notification not found.")
+    return {"status": "success"}
+
+@app.get("/health", tags=["Notifications & Health"])
+async def health_check():
+    """(ينفذ /health) [cite: 70] - فحص صحة الخادم."""
+    return {"status": "ok", "timestamp": datetime.now().isoformat()}
 
 # =======================================================================================
-# --- واجهة الويب (Web UI) والبث المباشر (Log Stream) ---
-#
+# --- خدمة واجهة الويب (Web UI) ---
+# [cite: 10-12, 18]
 # =======================================================================================
 
-try:
-    with open("index.html", "r", encoding="utf-8") as f:
-        HTML_CONTENT = f.read()
-except FileNotFoundError:
-    logger.warning("index.html not found. Web UI will be disabled.")
-    HTML_CONTENT = "<html><body><h1>index.html not found.</h1></body></html>"
+# 1. تحديد مسار مجلد 'dist'
+UI_BUILD_DIR = os.path.join(os.path.dirname(__file__), "dist")
 
-@app.get("/", response_class=HTMLResponse)
-async def get_homepage():
-    """يخدم واجهة الويب index.html"""
-    return HTMLResponse(content=HTML_CONTENT)
+# 2. خدمة ملفات assets (JS/CSS)
+app.mount("/assets", StaticFiles(directory=os.path.join(UI_BUILD_DIR, "assets")), name="assets")
 
-@app.get("/active_trades")
-async def get_active_trades_for_web():
-    """
-    مسار مخصص لـ index.html.
-    يستخدم مستخدم "تجريبي" ثابت.
-    """
-    try:
-        # !!! هام: هذا يستخدم user_id ثابت. يجب تغييره بنظام مصادقة للويب
-        DEMO_USER_ID = UUID("00000000-0000-0000-0000-000000000001") # (مثال)
-        trades = await db_utils.get_dashboard_trades_for_user(DEMO_USER_ID)
-        return trades
-    except Exception as e:
-        logger.error(f"API /active_trades (web) error: {e}")
-        return JSONResponse(content={"error": str(e)}, status_code=500)
-
-@app.websocket("/ws/logs")
-async def websocket_endpoint(websocket: WebSocket):
-    """(ينفذ مطلب index.html) يبث سجلات الخادم."""
-    await websocket.accept()
-    logger.info("API_WS: Log client connected.")
-    try:
-        # هذا مثال بسيط. في الإنتاج، يجب قراءة السجلات من ملف
-        # أو استخدام نظام (logging handler) مخصص لـ WebSocket.
-        while True:
-            log_message = f"{datetime.now().isoformat()} - API Server Log: Heartbeat."
-            await websocket.send_text(log_message)
-            await asyncio.sleep(5)
-    except Exception:
-        logger.info("API_WS: Log client disconnected.")
+# 3. خدمة الملف الرئيسي index.html لجميع المسارات الأخرى
+@app.get("/{full_path:path}", response_class=HTMLResponse)
+async def serve_react_app(request: Request, full_path: str):
+    index_path = os.path.join(UI_BUILD_DIR, "index.html")
+    if not os.path.exists(index_path):
+        logger.warning(f"index.html not found at {index_path}")
+        return HTMLResponse("<h1>Frontend build files (dist) not found.</h1>", status_code=404)
+    
+    return FileResponse(index_path)
 
 # =======================================================================================
 # --- أحداث بدء وإيقاف التشغيل ---
@@ -338,11 +355,11 @@ async def websocket_endpoint(websocket: WebSocket):
 async def on_startup():
     await db_utils.get_db_pool() # تهيئة مجموعة الاتصالات
     await PUBLIC_EXCHANGE.load_markets() # تحميل الأسواق العامة
-    logger.info("--- 🚀 FastAPI Server Started (V6.6 SaaS) ---")
+    logger.info("--- 🚀 FastAPI Server Started (V2 - Matched to UI) ---")
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    await ccxt_manager.close_all_connections()
+    await close_all_cached_connections()
     await PUBLIC_EXCHANGE.close()
     if db_utils.POOL:
         await db_utils.POOL.close()
@@ -350,7 +367,6 @@ async def on_shutdown():
 
 if __name__ == "__main__":
     # هذا التشغيل للتطوير فقط
-    # في الإنتاج، استخدم Gunicorn:
-    # gunicorn -w 4 -k uvicorn.workers.UvicornWorker main:app
-    port = int(os.getenv("PORT", 8001))
+    # في الإنتاج، استخدم Gunicorn
+    port = int(os.getenv("PORT", 8000)) # الواجهة تتوقع 8000
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
