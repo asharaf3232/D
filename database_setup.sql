@@ -1,127 +1,128 @@
--- تفعيل ملحقات UUID إذا لم تكن مفعلة (مهم لـ Supabase)
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+-- تفعيل ملحق RLS (Row Level Security) في Supabase
+-- CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
--- 1. جدول المستخدمين (يرتبط بمستخدمي Supabase Auth أو أي نظام مصادقة)
-CREATE TABLE IF NOT EXISTS user_profiles (
-    user_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    email TEXT UNIQUE NOT NULL,
-    telegram_chat_id BIGINT UNIQUE, -- لربط مستخدم تليجرام بحسابه
-    created_at TIMESTAMPTZ DEFAULT now()
-);
+-- 1. جدول المستخدمين (الذي تتوقعه Supabase)
+-- (نفترض أن هذا الجدول موجود بالفعل في Supabase Auth)
+-- CREATE TABLE IF NOT EXISTS public.users ( ... );
 
--- 2. جدول مفاتيح API (مشفرة)
--- يخزن مفاتيح المستخدمين بشكل آمن
+-- 2. جدول مفاتيح API (الذي يتوقعه الخادم)
 CREATE TABLE IF NOT EXISTS user_api_keys (
     id BIGSERIAL PRIMARY KEY,
-    user_id UUID NOT NULL REFERENCES user_profiles(user_id) ON DELETE CASCADE,
+    user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
     exchange TEXT NOT NULL DEFAULT 'binance',
-    api_key_encrypted TEXT NOT NULL,  -- يجب تشفيرها قبل التخزين
-    api_secret_encrypted TEXT NOT NULL, -- يجب تشفيرها قبل التخزين
-    is_valid BOOLEAN DEFAULT true,
+    api_key_encrypted TEXT NOT NULL,
+    api_secret_encrypted TEXT NOT NULL,
+    passphrase_encrypted TEXT, -- لـ OKX أو غيرها
+    is_valid BOOLEAN DEFAULT false,
+    created_at TIMESTAMPTZ DEFAULT now(),
     UNIQUE(user_id, exchange)
 );
 
--- 3. جدول الإعدادات (بديل ملف settings.json الفردي)
--- كل مستخدم له صف الإعدادات الخاص به
+-- 3. جدول الإعدادات العامة للبوت (الذي تتوقعه دالة botAPI.getBotSettings)
+-- هذا الجدول سيقوم main.py بتحديثه
 CREATE TABLE IF NOT EXISTS user_settings (
-    user_id UUID PRIMARY KEY NOT NULL REFERENCES user_profiles(user_id) ON DELETE CASCADE,
-    
-    -- مفاتيح التشغيل
-    is_trading_enabled BOOLEAN NOT NULL DEFAULT false, -- مفتاح التشغيل/الإيقاف الرئيسي
-    active_preset_name TEXT DEFAULT 'مخصص',
+    user_id UUID PRIMARY KEY NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+    is_running BOOLEAN NOT NULL DEFAULT false, -- (يتحكم به /bot/start و /bot/stop)
+    current_preset_name TEXT DEFAULT 'professional',
+    -- (يمكن إضافة أي إعدادات عامة أخرى هنا)
+    updated_at TIMESTAMPTZ DEFAULT now()
+);
 
-    -- إعدادات المخاطر
-    real_trade_size_usdt REAL NOT NULL DEFAULT 15.0,
-    max_concurrent_trades INT NOT NULL DEFAULT 5,
-    atr_sl_multiplier REAL NOT NULL DEFAULT 2.5,
-    risk_reward_ratio REAL NOT NULL DEFAULT 2.0,
+-- 4. جدول الاستراتيجيات (الذي تتوقعه صفحة Strategies.tsx )
+-- هذا الجدول تتحدث معه الواجهة مباشرة عبر Supabase
+CREATE TABLE IF NOT EXISTS strategies (
+    id BIGSERIAL PRIMARY KEY,
+    user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+    strategy_name TEXT NOT NULL, -- (مثل 'momentum_breakout')
+    display_name TEXT NOT NULL,  -- (مثل 'ماسح الاختراقات')
+    is_enabled BOOLEAN NOT NULL DEFAULT true,
+    parameters JSONB,
+    -- بيانات الأداء التي يمكن أن يحدّثها العامل
+    total_signals INT DEFAULT 0,
+    successful_signals INT DEFAULT 0,
+    last_signal_time TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    UNIQUE(user_id, strategy_name)
+);
 
-    -- إعدادات الوقف المتحرك
-    trailing_sl_enabled BOOLEAN NOT NULL DEFAULT true,
-    trailing_sl_activation_percent REAL NOT NULL DEFAULT 2.0,
-    trailing_sl_callback_percent REAL NOT NULL DEFAULT 1.5,
+-- 5. جدول المتغيرات المتقدمة (الذي تتوقعه صفحة AdvancedVariables.tsx )
+-- هذا الجدول أيضاً تتحدث معه الواجهة مباشرة عبر Supabase
+CREATE TABLE IF NOT EXISTS advanced_variables (
+    id BIGSERIAL PRIMARY KEY,
+    user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE UNIQUE,
     
-    -- إعدادات الماسح والفلاتر
-    top_n_symbols_by_volume INT NOT NULL DEFAULT 300,
-    worker_threads INT NOT NULL DEFAULT 10, -- (قد يتم تجاهله في بنية العامل الجديدة)
-    active_scanners JSONB NOT NULL DEFAULT '["momentum_breakout", "breakout_squeeze_pro"]',
-    asset_blacklist JSONB NOT NULL DEFAULT '["USDC", "USDT", "BTC", "ETH"]',
+    -- إدارة المخاطر
+    risk_per_trade REAL DEFAULT 2,
+    max_drawdown REAL DEFAULT 20,
+    stop_loss_percentage REAL DEFAULT 2,
+    take_profit_percentage REAL DEFAULT 4,
+    risk_reward_ratio REAL DEFAULT 2,
     
-    -- فلاتر السوق
-    market_mood_filter_enabled BOOLEAN NOT NULL DEFAULT true,
-    fear_and_greed_threshold INT NOT NULL DEFAULT 30,
-    adx_filter_enabled BOOLEAN NOT NULL DEFAULT true,
-    adx_filter_level INT NOT NULL DEFAULT 25,
-    btc_trend_filter_enabled BOOLEAN NOT NULL DEFAULT true,
-    news_filter_enabled BOOLEAN NOT NULL DEFAULT true,
+    -- إعدادات الماسحات
+    scanner_period INT DEFAULT 20,
+    momentum_threshold REAL DEFAULT 1.5,
+    signal_sensitivity TEXT DEFAULT 'medium',
+    indicator_integration BOOLEAN DEFAULT true,
     
-    -- (يمكن إضافة جميع الإعدادات المتقدمة من DEFAULT_SETTINGS هنا)
+    -- المحاسبة والرسوم
+    maker_commission REAL DEFAULT 0.02,
+    taker_commission REAL DEFAULT 0.04,
+    funding_fee REAL DEFAULT 0.03,
+    spread_adjustment REAL DEFAULT 0.5,
     
-    -- إعدادات الذكاء التكيفي
-    adaptive_intelligence_enabled BOOLEAN NOT NULL DEFAULT true,
-    dynamic_trade_sizing_enabled BOOLEAN NOT NULL DEFAULT true,
-    strategy_proposal_enabled BOOLEAN NOT NULL DEFAULT true,
-    wise_man_auto_close BOOLEAN NOT NULL DEFAULT true,
-    wise_guardian_enabled BOOLEAN NOT NULL DEFAULT true,
+    -- إعدادات التوقيت
+    trading_start_hour INT DEFAULT 0,
+    trading_end_hour INT DEFAULT 23,
+    market_sessions JSONB DEFAULT '["Asian", "European", "US"]',
+    cooldown_period INT DEFAULT 5,
+    max_concurrent_trades INT DEFAULT 3,
+    
+    -- التضخم والعملات
+    inflation_adjustment BOOLEAN DEFAULT false,
+    base_currency TEXT DEFAULT 'USDT',
+    currency_protection BOOLEAN DEFAULT true,
+    min_trade_amount REAL DEFAULT 10,
+    max_trade_amount REAL DEFAULT 1000,
+    
+    -- الذكاء الاصطناعي
+    confidence_threshold REAL DEFAULT 80,
+    pattern_sensitivity TEXT DEFAULT 'medium',
+    learning_enabled BOOLEAN DEFAULT true,
+    data_lookback_period INT DEFAULT 500,
 
     updated_at TIMESTAMPTZ DEFAULT now()
 );
 
--- 4. جدول الصفقات (الأساسي)
--- تم تعديله ليحتوي على user_id لعزل بيانات كل مستخدم
+-- 6. جدول الصفقات (الذي يتوقعه الخادم Bot Worker)
 CREATE TABLE IF NOT EXISTS trades (
     id BIGSERIAL PRIMARY KEY,
-    user_id UUID NOT NULL REFERENCES user_profiles(user_id) ON DELETE CASCADE,
-    
-    -- بيانات الصفقة الأساسية
-    timestamp TIMESTAMPTZ DEFAULT now(),
+    user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
     symbol TEXT NOT NULL,
+    status TEXT NOT NULL, -- 'pending', 'active', 'closed'
+    reason TEXT, -- (اسم الاستراتيجية)
     entry_price REAL,
+    exit_price REAL,
+    quantity REAL,
     take_profit REAL,
     stop_loss REAL,
-    quantity REAL,
-    status TEXT NOT NULL, -- 'pending', 'active', 'closing', 'closed (TP)', 'closed (SL)', 'closed (Manual)', 'incubated'
-    reason TEXT,
-    order_id TEXT,
-    
-    -- بيانات التتبع والإدارة
-    highest_price REAL DEFAULT 0,
-    trailing_sl_active BOOLEAN DEFAULT false,
-    last_profit_notification_price REAL DEFAULT 0,
-    
-    -- بيانات الإغلاق
-    close_price REAL,
     pnl_usdt REAL,
-    
-    -- بيانات التحليل
-    signal_strength INTEGER DEFAULT 1,
-    trade_weight REAL DEFAULT 1.0,
-    
-    UNIQUE(user_id, symbol, status) -- لمنع فتح صفقتين نشطتين لنفس العملة (اختياري لكن موصى به)
-        WHERE status IN ('active', 'pending')
+    order_id TEXT,
+    opened_at TIMESTAMPTZ DEFAULT now(),
+    closed_at TIMESTAMPTZ
 );
 
--- 5. جدول سجل التحليل (من Smart Engine)
--- منفصل لتخزين بيانات التحليل العميقة
-CREATE TABLE IF NOT EXISTS trade_journal (
+-- 7. جدول الإشعارات (الذي تتوقعه دالة getNotifications [cite: 13])
+CREATE TABLE IF NOT EXISTS notifications (
     id BIGSERIAL PRIMARY KEY,
-    user_id UUID NOT NULL REFERENCES user_profiles(user_id) ON DELETE CASCADE,
-    trade_id BIGINT NOT NULL REFERENCES trades(id) ON DELETE CASCADE,
-    
-    -- بيانات الدخول
-    entry_strategy TEXT,
-    entry_indicators_snapshot JSONB,
-    
-    -- بيانات الخروج
-    exit_reason TEXT,
-    exit_quality_score INT,
-    post_exit_performance JSONB,
-    notes TEXT,
-
-    UNIQUE(user_id, trade_id)
+    user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+    timestamp TIMESTAMPTZ DEFAULT now(),
+    title TEXT NOT NULL,
+    message TEXT NOT NULL,
+    type TEXT DEFAULT 'info', -- 'info', 'success', 'warning', 'error'
+    is_read BOOLEAN DEFAULT false,
+    related_trade_id BIGINT REFERENCES trades(id) ON DELETE SET NULL
 );
 
--- إنشاء فهارس (Indexes) لتسريع الاستعلامات الشائعة
+-- إنشاء فهارس (Indexes) لتسريع الاستعلامات
 CREATE INDEX IF NOT EXISTS idx_trades_user_status ON trades (user_id, status);
-CREATE INDEX IF NOT EXISTS idx_trades_symbol_status ON trades (symbol, status);
-CREATE INDEX IF NOT EXISTS idx_journal_trade_id ON trade_journal (trade_id);
+CREATE INDEX IF NOT EXISTS idx_notifications_user_read ON notifications (user_id, is_read);
