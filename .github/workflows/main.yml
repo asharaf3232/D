@@ -1,0 +1,47 @@
+name: Deploy SaaS Trading Platform
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+    - name: SSH and Deploy
+      uses: appleboy/ssh-action@master
+      with:
+        host: ${{ secrets.VPS_SSH_HOST }}
+        username: ${{ secrets.VPS_SSH_USERNAME }}
+        key: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
+        script: |
+          # 1. الانتقال إلى مجلد المشروع
+          cd /root/bots/SaaS-Trader # (افترض أن هذا هو المجلد الجديد)
+          
+          # 2. سحب آخر التحديثات من Git
+          git fetch --all
+          git reset --hard origin/main
+          
+          # 3. تثبيت/تحديث المكتبات (يفضل استخدام بيئة افتراضية venv)
+          # (إذا كنت تستخدم venv: source venv/bin/activate)
+          pip install -r requirements.txt
+          
+          # 4. إعادة تشغيل الخدمات باستخدام PM2
+          # (يجب أن تكون قد أعددت PM2 مسبقاً بهذه الأسماء)
+          
+          echo "Restarting services via PM2..."
+          
+          # أ. إعادة تشغيل خادم الويب (API Server)
+          # (يفترض أنك بدأته بـ: pm2 start "gunicorn -w 4 -k uvicorn.workers.UvicornWorker main:app" --name "saas-api-server")
+          pm2 reload saas-api-server
+          
+          # ب. إعادة تشغيل العامل (Bot Worker)
+          # (يفترض أنك بدأته بـ: pm2 start bot_worker.py --name "saas-bot-worker" --interpreter python3)
+          pm2 reload saas-bot-worker
+          
+          # ج. إعادة تشغيل واجهة التليجرام (Telegram UI)
+          # (يفترض أنك بدأته بـ: pm2 start telegram_ui.py --name "saas-telegram-ui" --interpreter python3)
+          pm2 reload saas-telegram-ui
+          
+          echo "Deployment complete."
