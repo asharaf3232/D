@@ -4,9 +4,11 @@ import pandas_ta as ta
 import ccxt.async_support as ccxt
 import asyncio
 import json
-import db_utils # لاستيراد نماذج Pydantic
-from db_utils import UserSettings, ActiveTradeMonitor
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
+from uuid import UUID
+
+# (استيراد النماذج الجديدة سيكون في bot_worker.py)
+# from db_utils import TradingVariables, ActiveTradeMonitor
 
 try:
     from scipy.signal import find_peaks
@@ -33,6 +35,7 @@ def find_col(df_columns, prefix):
 # =======================================================================================
 # --- دوال الماسح (من BN.py) ---
 #
+# [cite_start]هذه هي الاستراتيجيات المذكورة في Scanners.tsx [cite: 269]
 # =======================================================================================
 
 def analyze_momentum_breakout(df: pd.DataFrame, params: dict, rvol: float, adx_value: float) -> Optional[Dict]:
@@ -186,7 +189,7 @@ def analyze_supertrend_pullback(df: pd.DataFrame, params: dict, rvol: float, adx
             return {"reason": "supertrend_pullback"}
     return None
 
-# قاموس الماسحات (من BN.py)
+# قاموس الماسحات (من BN.py و Scanners.tsx)
 SCANNERS_MAP = {
     "momentum_breakout": analyze_momentum_breakout, 
     "breakout_squeeze_pro": analyze_breakout_squeeze_pro,
@@ -195,20 +198,26 @@ SCANNERS_MAP = {
     "whale_radar": analyze_whale_radar,
     "rsi_divergence": analyze_rsi_divergence, 
     "supertrend_pullback": analyze_supertrend_pullback
+    # (يمكن إضافة الاستراتيجيات الأخرى من Strategies.tsx هنا)
 }
 
 # =======================================================================================
 # --- دوال الرجل الحكيم (من wise_man.py) ---
 #
+# هذه الدوال ستدعم إعدادات 'wise_guardian_enabled' و 'wise_man_auto_close'
 # =======================================================================================
 
-async def wise_man_deep_analysis(trade: ActiveTradeMonitor, settings: UserSettings, exchange: ccxt.Exchange) -> Optional[str]:
+async def wise_man_deep_analysis(
+    trade_id: int, 
+    symbol: str, 
+    settings: dict, # (سيتم تمرير TradingVariables كـ dict)
+    exchange: ccxt.Exchange
+) -> Optional[str]:
     """
     [لقطع الخسائر] تحلل صفقة واحدة بعمق.
     تعيد "force_exit" إذا كان الإغلاق مطلوباً، أو "notify_weak" إذا كان الإغلاق معطلاً.
     """
-    symbol = trade.symbol
-    logger.info(f"🧠 Wise Man summoned for deep analysis of trade #{trade.id} [{symbol}]...")
+    logger.info(f"🧠 Wise Man summoned for deep analysis of trade #{trade_id} [{symbol}]...")
 
     try:
         ohlcv_task = exchange.fetch_ohlcv(symbol, '15m', limit=100)
@@ -234,27 +243,31 @@ async def wise_man_deep_analysis(trade: ActiveTradeMonitor, settings: UserSettin
         logger.info(f"Analysis for {symbol}: is_weak={is_weak}, btc_is_bearish={btc_is_bearish}")
 
         if is_weak and btc_is_bearish:
-            if settings.wise_man_auto_close:
-                logger.info(f"Wise Man: Recommending FORCE_EXIT for trade #{trade.id}.")
+            [cite_start]if settings.get("wise_man_auto_close", True): # [cite: 399]
+                logger.info(f"Wise Man: Recommending FORCE_EXIT for trade #{trade_id}.")
                 return "force_exit" # إشارة للعامل بالإغلاق
             else:
-                logger.info(f"Wise Man: Recommending NOTIFY_WEAK for trade #{trade.id}.")
+                logger.info(f"Wise Man: Recommending NOTIFY_WEAK for trade #{trade_id}.")
                 return "notify_weak" # إشارة للعامل بإرسال إشعار فقط
         else:
             logger.info(f"Wise Man Deep Analysis Concluded: No critical weakness found for {symbol}.")
             return None
 
     except Exception as e:
-        logger.error(f"Wise Man: Deep analysis failed for trade #{trade.id}: {e}", exc_info=True)
+        logger.error(f"Wise Man: Deep analysis failed for trade #{trade_id}: {e}", exc_info=True)
         return None
 
-async def wise_man_check_momentum(trade: ActiveTradeMonitor, settings: UserSettings, exchange: ccxt.Exchange) -> Optional[float]:
+async def wise_man_check_momentum(
+    trade: Dict, # (صف من جدول trades) 
+    settings: dict, # (TradingVariables كـ dict)
+    exchange: ccxt.Exchange
+) -> Optional[float]:
     """
     [لتمديد الأرباح] تتحقق من الزخم.
     تعيد new_tp (float) إذا كان التمديد مطلوباً.
     """
-    symbol = trade.symbol
-    trade_id = trade.id
+    symbol = trade['symbol']
+    trade_id = trade['id']
     logger.info(f"🧠 Wise Man checking strong momentum for trade #{trade_id} [{symbol}]...")
 
     try:
@@ -269,8 +282,7 @@ async def wise_man_check_momentum(trade: ActiveTradeMonitor, settings: UserSetti
             return None
         current_adx = adx_data.iloc[-1]['ADX_14']
         
-        # هذه الإعدادات مخصصة، يجب إضافتها إلى user_settings في db_setup
-        strong_adx_level = 30 # settings.get('wise_man_strong_adx_level', 30)
+        strong_adx_level = 30 # (يمكن سحبها من settings إذا أضيفت)
 
         if current_adx > strong_adx_level:
             current_price = df['close'].iloc[-1]
@@ -280,9 +292,12 @@ async def wise_man_check_momentum(trade: ActiveTradeMonitor, settings: UserSetti
                 return None
             
             atr = df.iloc[-1].get(atr_col, 0)
-            new_tp = current_price + (atr * settings.risk_reward_ratio)
+            if atr == 0:
+                return None
+                
+            new_tp = current_price + (atr * settings.get('risk_reward_ratio', 2.0))
             
-            if new_tp > trade.take_profit:
+            if new_tp > trade['take_profit']:
                 logger.info(f"Wise Man: Recommending TP extension for trade #{trade_id} to {new_tp}.")
                 return new_tp # إشارة للعامل بتحديث الهدف
         
@@ -295,6 +310,7 @@ async def wise_man_check_momentum(trade: ActiveTradeMonitor, settings: UserSetti
 # =======================================================================================
 # --- دوال العقل الذكي (من smart_engine.py) ---
 #
+# [cite_start]هذه الدوال ستدعم إعداد 'learning_enabled' [cite: 397]
 # =======================================================================================
 
 async def smart_engine_capture_snapshot(exchange: ccxt.Exchange, symbol: str) -> dict:
@@ -313,7 +329,7 @@ async def smart_engine_capture_snapshot(exchange: ccxt.Exchange, symbol: str) ->
 async def smart_engine_what_if_analysis(
     exchange: ccxt.Exchange, 
     closed_trade: Dict[str, Any], 
-    settings: UserSettings
+    settings: dict # (TradingVariables كـ dict)
 ) -> Optional[Dict]:
     """
     يحلل سلوك العملة بعد الخروج.
@@ -323,13 +339,12 @@ async def smart_engine_what_if_analysis(
     symbol = closed_trade.get('symbol')
     exit_reason = closed_trade.get('status', '')
     original_tp = closed_trade.get('take_profit')
-    risk_reward_ratio = settings.risk_reward_ratio
+    risk_reward_ratio = settings.get('risk_reward_ratio', 2.0)
     analysis_period_candles = 24 #
 
     logger.info(f"🔬 Smart Engine: Performing 'What-If' analysis for closed trade #{trade_id} ({symbol})...")
     try:
-        # الانتظار قليلاً لضمان مرور بعض الوقت قبل التحليل
-        await asyncio.sleep(60) 
+        await asyncio.sleep(60) #
         
         future_ohlcv = await exchange.fetch_ohlcv(symbol, '15m', limit=analysis_period_candles)
         df_future = pd.DataFrame(future_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -339,7 +354,8 @@ async def smart_engine_what_if_analysis(
         score = 0
         notes = ""
         
-        if '(SL)' in exit_reason or '(Manual)' in exit_reason and closed_trade.get('pnl_usdt', 0) < 0:
+        # (تم تبسيط منطق 'الندم'، يمكن استخدام المنطق الأصلي)
+        if closed_trade.get('pnl_usdt', 0) < 0:
             if highest_price_after >= original_tp:
                 score = -10
                 notes = f"Stop Loss Regret: Price recovered and hit original TP ({original_tp})."
@@ -347,14 +363,11 @@ async def smart_engine_what_if_analysis(
                 score = 10
                 notes = f"Good Save: Price continued to drop to {lowest_price_after} after SL."
         
-        elif '(TP)' in exit_reason or '(TSL)' in exit_reason:
+        elif closed_trade.get('pnl_usdt', 0) > 0:
             missed_profit_pct = ((highest_price_after / original_tp) - 1) * 100 if original_tp > 0 else 0
             if missed_profit_pct > (risk_reward_ratio * 100):
                 score = -5
                 notes = f"Missed Opportunity: Price rallied an additional {missed_profit_pct:.2f}% after TP."
-            elif missed_profit_pct > 1.0:
-                score = 5
-                notes = f"Good Exit: Price rallied a little more."
             else:
                 score = 10
                 notes = f"Perfect Exit: Price dropped or stalled after TP."
