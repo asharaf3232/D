@@ -1,0 +1,18 @@
+# --- للخادم (main.py) ---
+fastapi[all]         # خادم الويب السريع (يشمل uvicorn, pydantic)
+gunicorn             # خادم الإنتاج (لتشغيل main:app)
+aiohttp              # (يستخدم في main.py لجلب F&G)
+
+# --- لواجهة التليجرام (telegram_ui.py) ---
+python-telegram-bot  # مكتبة التليجرام
+httpx                # لإرسال طلبات API إلى main.py
+
+# --- للعامل (bot_worker.py) ---
+ccxt                 # مكتبة التداول الأساسية
+websockets           # للاتصال ببث Binance العام
+pandas               # لتحليل بيانات OHLCV
+pandas-ta            # للمؤشرات الفنية
+scipy                # لبعض الاستراتيجيات مثل RSI Divergence
+
+# --- مشتركة (قاعدة البيانات) ---
+asyncpg              # المشغل غير المتزامن لـ PostgreSQL
