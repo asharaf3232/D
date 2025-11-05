@@ -1,4 +1,4 @@
-name: Deploy SaaS Trading Platform (V2)
+name: Deploy SaaS Trading Platform (V4 - Final)
 
 on:
   push:
@@ -17,8 +17,7 @@ jobs:
         key: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
         script: |
           # 1. الانتقال إلى مجلد المشروع
-          # (تأكد من أن هذا هو المسار الصحيح على الخادم)
-          cd /root/bots/SaaS-Trader-V2
+          cd /root/SaaS_Trader_V4 # (تأكد من أن هذا هو المسار الصحيح على الخادم)
           
           # 2. سحب آخر التحديثات من Git
           echo "Pulling latest code..."
@@ -26,34 +25,34 @@ jobs:
           git reset --hard origin/main
           
           # 3. تثبيت/تحديث مكتبات Python (الخلفية)
-          # (نفترض أنك تستخدم بيئة افتراضية venv)
           echo "Installing Python dependencies..."
+          # (نفترض أنك تستخدم بيئة افتراضية venv)
           source venv/bin/activate
           pip install -r requirements.txt
           
-          # 4. (اختياري) بناء واجهة الويب (React UI)
-          # إذا كان الكود المصدري للواجهة (src) موجوداً في المستودع
-          # echo "Building React UI..."
-          # cd /path/to/your/ui/source/code # (غيّر هذا المسار)
-          # npm install
-          # npm run build
-          #
-          # (انسخ ملفات dist إلى المجلد الذي يخدمه main.py)
-          # echo "Copying UI build to server directory..."
-          # cp -R dist/* /root/bots/SaaS-Trader-V2/dist/
-          # cd /root/bots/SaaS-Trader-V2
+          # 4. (هام) نسخ واجهة الويب
+          # هذا يفترض أن مجلد 'dist' الخاص بواجهة React موجود في المستودع
+          # إذا لم يكن موجوداً، يجب عليك رفعه يدوياً إلى الخادم في هذا المسار
+          echo "Syncing Web UI (dist)..."
+          # (تأكد من أن 'dist' موجود في المستودع أو تم بناؤه)
           
-          # 5. إعادة تشغيل الخدمات باستخدام PM2
-          # (يجب أن تكون قد أعددت PM2 مسبقاً بهذه الأسماء)
-          
-          echo "Restarting services via PM2..."
+          # 5. إعادة تشغيل الخدمات الأربعة باستخدام PM2
+          echo "Restarting all 4 services via PM2..."
           
           # أ. إعادة تشغيل خادم الويب (API Server)
-          # (يفترض أنك بدأته بـ: pm2 start "gunicorn -w 4 -k uvicorn.workers.UvicornWorker main:app --bind 0.0.0.0:8000" --name "saas-api-server")
+          # (يفترض أنك بدأته بـ: pm2 start "python-dotenv -e .env gunicorn -w 4 -k uvicorn.workers.UvicornWorker main:app --bind 0.0.0.0:8000" --name "saas-api-server")
           pm2 reload saas-api-server
           
           # ب. إعادة تشغيل العامل (Bot Worker)
-          # (يفترض أنك بدأته بـ: pm2 start bot_worker.py --name "saas-bot-worker" --interpreter venv/bin/python3)
+          # (يفترض أنك بدأته بـ: pm2 start "python-dotenv -e .env python3 bot_worker.py" --name "saas-bot-worker" --interpreter venv/bin/python3)
           pm2 reload saas-bot-worker
+          
+          # ج. إعادة تشغيل واجهة التليجرام (Telegram UI)
+          # (يفترض أنك بدأته بـ: pm2 start "python-dotenv -e .env python3 telegram_ui_v4.1.py" --name "saas-telegram-ui" --interpreter venv/bin/python3)
+          pm2 reload saas-telegram-ui
+          
+          # د. إعادة تشغيل مرسل الإشعارات (Telegram Notifier)
+          # (يفترض أنك بدأته بـ: pm2 start "python-dotenv -e .env python3 telegram_notifier.py" --name "saas-telegram-notifier" --interpreter venv/bin/python3)
+          pm2 reload saas-telegram-notifier
           
           echo "Deployment complete."
