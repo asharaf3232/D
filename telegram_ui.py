@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 # =======================================================================================
-# --- 🚀 واجهة بوت التداول V3.2 (SaaS Client - مع ربط /myid) 🚀 ---
+# --- 🚀 واجهة بوت التداول V4.1 (SaaS Client - الربط الآمن) 🚀 ---
 # =======================================================================================
 #
 # هذا الملف هو واجهة المستخدم (UI) فقط.
-# إنه "عميل API" يتحدث إلى خادم main.py (V3).
-# [تحديث] يستخدم هذا الإصدار /myid للربط بدلاً من /login.
+# [تحديث V4.1] يستخدم هذا الإصدار /login <token> للربط الآمن لمرة واحدة.
 #
 # =======================================================================================
 
@@ -29,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 # --- متغيرات البيئة ---
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-API_SERVER_URL = os.getenv('API_SERVER_URL', 'http://127.0.0.1:8000') # خادم V3
+API_SERVER_URL = os.getenv('API_SERVER_URL', 'http://127.0.0.1:8000') # خادم V4
 
 # --- ثوابت (من BN.py) ---
 STRATEGY_NAMES_AR = {
@@ -45,48 +44,15 @@ PRESET_NAMES_AR = {"professional": "احترافي", "strict": "متشدد", "le
 
 async def get_api_headers(context: ContextTypes.DEFAULT_TYPE) -> dict:
     """
-    [تعديل V3.2]
-    لم يعد هذا يجلب التوكن. بدلاً من ذلك، الخادم سيحتاج إلى ربط chat_id بالـ user_id.
-    أو، الطريقة الأسهل: البوت سيحتاج إلى جلب الـ user_id (التوكن) المرتبط بهذا الـ chat_id.
-    
-    *** تعديل هام: ***
-    لقد أخطأت في التصميم السابق. لا يمكننا استخدام /myid فقط.
-    يجب أن نستخدم /login مرة واحدة لربط chat_id بالـ user_id.
-    
-    الحل الأبسط هو الذي اقترحته:
-    1. المستخدم يكتب /myid -> البوت يرد بالـ chat_id.
-    2. المستخدم يذهب للويب ويلصق الـ chat_id.
-    3. الخادم يربط الـ user_id بالـ chat_id.
-    
-    ولكن... كيف سيقوم البوت بعمل مصادقة للطلبات؟
-    
-    الحل الصحيح هو:
-    1. المستخدم يكتب /login <token> (مرة واحدة فقط).
-    2. البوت يرسل هذا التوكن + الـ chat_id الخاص به إلى الخادم (POST /telegram/link-account).
-    3. الخادم يحفظ أن 'user_id' (التوكن) مرتبط بهذا 'chat_id'.
-    
-    الآن، في كل مرة يتحدث فيها المستخدم:
-    1. البوت يرسل *فقط* الـ chat_id إلى الخادم.
-    2. الخادم يبحث عن الـ chat_id، يجد الـ user_id، وينفذ الأمر.
-    
-    هذا يعني أننا بحاجة إلى تعديل `main.py` (V4) مرة أخرى.
-    
-    --- (سأعتمد الحل الأبسط الذي اقترحته أولاً: /myid) ---
-    
-    *** إعادة تصميم V3.2 (بناءً على فكرتك): ***
-    لن نستخدم /login. سنستخدم /myid.
-    المستخدم سيربط الـ chat_id في واجهة الويب.
-    الخادم (main.py) سيحتاج إلى مسار API جديد للتحقق من chat_id.
+    [تصميم V4.1 الآمن]
+    يستخدم التوكن (user_id) المخزن في ذاكرة الجلسة للمصادقة.
     """
-    
-    # [تصميم جديد V3.2] المصادقة الآن تتم عبر chat_id
-    chat_id = context._chat_id
-    if not chat_id:
-        raise ValueError("لا يمكن العثور على معرف الدردشة.")
-    
-    # سنقوم بتمرير chat_id كـ "توكن" مؤقت
-    # الخادم (main.py V4.1) سيحتاج إلى البحث عن المستخدم عبر هذا الـ ID
-    return {'Authorization': f'Bearer chat_id_{chat_id}'}
+    user_id_token = context.user_data.get('user_id_token')
+    if not user_id_token:
+        logger.warning("User ID token not found in context.user_data. User must /login.")
+        raise ValueError("أنت غير مسجل. الرجاء استخدام أمر /login <token> أولاً.")
+        
+    return {'Authorization': f'Bearer {user_id_token}'}
 
 
 async def safe_send_message(bot, chat_id, text, **kwargs):
@@ -136,28 +102,54 @@ async def clear_settings_cache(context: ContextTypes.DEFAULT_TYPE):
         del context.user_data['settings_cache']
 
 # =======================================================================================
-# --- [جديد V3.2] أوامر الربط ---
+# --- [جديد V4.1] المصادقة والربط ---
 # =======================================================================================
 
-async def myid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    (جديد) ينفذ فكرتك. يرسل للمستخدم معرف الدردشة الخاص به.
+    (جديد) الربط الآمن لمرة واحدة.
+    1. يحفظ التوكن في الذاكرة للأوامر.
+    2. يرسل التوكن + chat_id للخادم لربط الإشعارات.
     """
+    if not context.args:
+        await update.message.reply_text("الرجاء إدخال الـ User ID (Token) الخاص بك. \nمثال: `/login <your-uuid-token>`\n\n(يمكنك نسخه من صفحة ملفك الشخصي في واجهة الويب)")
+        return
+        
+    user_id_token = context.args[0]
     chat_id = update.message.chat_id
-    message = (
-        f"معرف تليجرام الخاص بك هو:\n`{chat_id}`\n\n"
-        f"يرجى نسخ هذا الرقم ولصقه في حقل 'معرف تليجرام' في صفحة الإعدادات على واجهة الويب لربط حسابك وتلقي الإشعارات."
-    )
-    await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
+    
+    try:
+        # 1. التحقق من أن التوكن صالح (UUID)
+        UUID(user_id_token, version=4)
+        
+        # 2. إرسال طلب الربط إلى الخادم (لربط الإشعارات)
+        headers = {'Authorization': f'Bearer {user_id_token}'} # استخدام التوكن الجديد للمصادقة
+        payload = {'telegram_chat_id': chat_id}
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(f"{API_SERVER_URL}/telegram/link-account", json=payload, headers=headers, timeout=10.0)
+            response.raise_for_status() # (سيثير خطأ إذا فشل الربط 400/500)
+        
+        # 3. إذا نجح الربط، احفظ التوكن في الذاكرة (للأوامر المستقبلية)
+        context.user_data['user_id_token'] = user_id_token
+        await update.message.reply_text(f"✅ تم ربط حسابك بنجاح!\nمعرف الدردشة `{chat_id}` مرتبط الآن بحسابك.\n\nأنت جاهز لاستقبال الإشعارات واستخدام لوحة التحكم.")
+    
+    except (ValueError, TypeError):
+        await update.message.reply_text("❌ الـ Token غير صالح. الرجاء إدخال UUID صحيح.")
+    except httpx.HTTPStatusError as e:
+        error_msg = e.response.json().get('detail', str(e))
+        await update.message.reply_text(f"❌ فشل الربط:\n`{error_msg}`\n\nتأكد أن التوكن صحيح وأن حساب التليجرام هذا غير مرتبط بحساب آخر.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ حدث خطأ غير متوقع: {e}")
+
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """(من BN.py) - معدل لـ V3.2"""
+    """(من BN.py) - معدل لـ V4.1"""
     keyboard = [["Dashboard 🖥️"], ["الإعدادات ⚙️"]]
-    await update.message.reply_text("أهلاً بك في **بوت باينانس V3 (SaaS)**\n\n"
-                                  "لربط هذا البوت بحسابك على واجهة الويب:\n"
-                                  "1. أرسل الأمر `/myid` الآن.\n"
-                                  "2. انسخ الرقم الذي سأرسله لك.\n"
-                                  "3. اذهب إلى صفحة الإعدادات في واجهة الويب والصق الرقم هناك واضغط حفظ.",
+    await update.message.reply_text("أهلاً بك في **بوت باينانس V4 (SaaS)**\n\n"
+                                  "لربط هذا البوت بحسابك على واجهة الويب (مرة واحدة فقط):\n"
+                                  "1. اذهب إلى واجهة الويب وانسخ `User ID` (التوكن) الخاص بك.\n"
+                                  "2. أرسل الأمر التالي هنا:\n`/login <Your-User-ID-Token>`",
                                   reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True), 
                                   parse_mode=ParseMode.MARKDOWN)
 
@@ -184,8 +176,13 @@ async def show_dashboard_command(update: Update, context: ContextTypes.DEFAULT_T
 
     except (ValueError, httpx.HTTPStatusError) as e:
         logger.error(f"Failed to fetch bot status: {e}")
+        error_detail = "غير معروف"
+        if isinstance(e, ValueError):
+            error_detail = str(e) # (سيعرض "أنت غير مسجل...")
+        else:
+            error_detail = e.response.json().get('detail', 'خطأ في الاتصال')
         ks_status_emoji = "❓"
-        ks_status_text = "خطأ (استخدم /myid ؟)"
+        ks_status_text = f"خطأ ({error_detail})"
     except Exception as e:
         logger.error(f"Failed to fetch bot status: {e}")
         ks_status_emoji = "❓"
@@ -385,7 +382,7 @@ async def show_diagnostics_command(update: Update, context: ContextTypes.DEFAULT
     except Exception as e: await safe_edit_message(query, f"❌ خطأ: {e}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 العودة", callback_data="back_to_dashboard")]]))
 
 # =======================================================================================
-# --- واجهة الإعدادات (النسخة الكاملة V3.2) ---
+# --- واجهة الإعدادات (النسخة الكاملة V4.1) ---
 # =======================================================================================
 
 async def show_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -503,7 +500,7 @@ async def show_presets_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_edit_message(query, f"**🗂️ أنماط جاهزة**\n\nالنمط الحالي: **{current_preset}**\nاختر نمط إعدادات جاهز:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 # =======================================================================================
-# --- معالجات الإعدادات (Handlers V3.2) ---
+# --- معالجات الإعدادات (Handlers V4.1) ---
 # =======================================================================================
 
 async def _update_settings(query: Update.callback_query, context: ContextTypes.DEFAULT_TYPE, updates: dict):
@@ -548,6 +545,10 @@ async def handle_scanner_toggle(update: Update, context: ContextTypes.DEFAULT_TY
             new_status = not scanner['is_enabled']
             toggle_res = await client.post(f"{API_SERVER_URL}/scanners/{scanner_key}/toggle", json={"enabled": new_status}, headers=headers)
             toggle_res.raise_for_status()
+        
+        # [إصلاح] تحديث الإعدادات المسبقة إلى "مخصص"
+        await _update_settings(query, context, {"active_preset_name": "مخصص"})
+        
         await show_scanners_menu(update, context)
     except (ValueError, httpx.HTTPStatusError) as e: await handle_api_error(query, e)
     except Exception as e: await safe_edit_message(query, f"❌ خطأ: {e}")
@@ -651,7 +652,7 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
         await show_settings_menu(update, context)
 
 async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """(من BN.py) - موجه الأزرار الرئيسي (النسخة الكاملة V3.2)"""
+    """(من BN.py) - موجه الأزرار الرئيسي (النسخة الكاملة V4.1)"""
     query = update.callback_query; await query.answer(); data = query.data
     
     if not data.startswith("param_") and not data.startswith("scanner_") and not data.startswith("preset_") and not data.startswith("settings_"):
@@ -694,12 +695,12 @@ def main():
     if not TELEGRAM_BOT_TOKEN: logger.critical("TELEGRAM_BOT_TOKEN not set! Exiting."); return
     if not API_SERVER_URL: logger.critical("API_SERVER_URL not set! Exiting."); return
 
-    logger.info("Starting Telegram UI Client (SaaS V3.2 - /myid Link)...")
+    logger.info("Starting Telegram UI Client (SaaS V4.1 - Secure Link)...")
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     
     application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("myid", myid_command)) # <-- [جديد V3.2]
-    # (تم حذف /login)
+    application.add_handler(CommandHandler("login", login_command)) # <-- [جديد V4.1]
+    # (تم حذف /myid)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, universal_text_handler))
     application.add_handler(CallbackQueryHandler(button_callback_handler))
     
@@ -713,21 +714,588 @@ if __name__ == '__main__':
 
 {
 type: uploaded file
-fileName: requirements.txt
+fileName: telegram_notifier.py
 fullContent:
-# --- للخادم (main.py) ---
-fastapi[all]         # خادم الويب السريع (يشمل uvicorn, pydantic)
-gunicorn             # خادم الإنتاج (لتشغيل main:app)
-python-dotenv        # لتحميل متغيرات البيئة (مثل DATABASE_URL)
+import asyncio
+import logging
+import asyncpg
+import os
+from telegram import Bot
+from telegram.constants import ParseMode
+from telegram.error import Forbidden, BadRequest
 
-# --- للعامل (bot_worker.py) ---
-ccxt                 # مكتبة التداول الأساسية
-websockets           # للاتصال ببث Binance العام
-pandas               # لتحليل بيانات OHLCV
-pandas-ta            # للمؤشرات الفنية
-scipy                # لبعض الاستراتيجيات مثل RSI Divergence
+# --- إعدادات أساسية ---
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger("TelegramNotifier")
 
-# --- مشتركة (قاعدة البيانات) ---
-asyncpg              # المشغل غير المتزامن لـ PostgreSQL
-pydantic             # لتعريف نماذج البيانات (Settings, Variables)
+# --- متغيرات البيئة ---
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:your-password@db.xyz.supabase.co:5432/postgres")
+POLL_INTERVAL_SECONDS = 5 # (كل 5 ثوانٍ يبحث عن إشعارات جديدة)
+
+# --- (نحتاج دوال اتصال قاعدة البيانات هنا أيضاً) ---
+POOL = None
+
+async def get_db_pool():
+    global POOL
+    if POOL is None:
+        try:
+            POOL = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+            logger.info("Notifier: Database connection pool created.")
+        except Exception as e:
+            logger.critical(f"Notifier: Failed to create database pool: {e}")
+            raise
+    return POOL
+
+@asynccontextmanager
+async def db_connection():
+    pool = await get_db_pool()
+    if pool is None:
+        raise ConnectionError("Database pool is not initialized.")
+    async with pool.acquire() as connection:
+        yield connection
+
+# --- الدالة الرئيسية للمرسل ---
+
+async def fetch_and_send_notifications(bot: Bot):
+    """
+    يجلب الإشعارات غير المقروءة ويرسلها.
+    """
+    try:
+        async with db_connection() as conn:
+            # [تعديل V4] جلب chat_id من user_settings بدلاً من user_profiles
+            notifications = await conn.fetch(
+                """
+                SELECT 
+                    n.id, 
+                    n.user_id, 
+                    n.title, 
+                    n.message, 
+                    n.type,
+                    s.telegram_chat_id
+                FROM 
+                    notifications AS n
+                JOIN 
+                    user_settings AS s ON n.user_id = s.user_id
+                WHERE 
+                    n.is_read = false 
+                    AND s.telegram_chat_id IS NOT NULL
+                ORDER BY 
+                    n.timestamp ASC
+                LIMIT 50; -- (إرسال 50 رسالة كحد أقصى في كل دورة)
+                """
+            )
+            
+            if not notifications:
+                return # لا يوجد شيء لإرساله
+
+            logger.info(f"Notifier: Found {len(notifications)} new notifications to send.")
+            
+            sent_ids = []
+            for record in notifications:
+                chat_id = record['telegram_chat_id']
+                if not chat_id:
+                    # (هذا الشرط يجب ألا يحدث بسبب JOIN)
+                    logger.warning(f"Notifier: Skipping notification {record['id']} for user {record['user_id']} (no chat_id linked).")
+                    sent_ids.append(record['id']) 
+                    continue
+                
+                # تنسيق الرسالة
+                icon_map = {
+                    'success': '✅', 'error': '🛑',
+                    'warning': '⚠️', 'info': '💡'
+                }
+                icon = icon_map.get(record['type'], 'ℹ️')
+                
+                message_text = (
+                    f"*{icon} {record['title']}*\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"{record['message']}"
+                )
+                
+                try:
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=message_text,
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                    sent_ids.append(record['id'])
+                except (Forbidden, BadRequest) as e:
+                    # إذا تم حظر البوت، سنتجاهل الإشعار
+                    logger.error(f"Notifier: Failed to send to chat_id {chat_id} (User blocked?): {e}")
+                    sent_ids.append(record['id']) # (نعتبرها "مرسلة")
+                except Exception as e:
+                    # خطأ مؤقت في الشبكة، لا نضع علامة "مقروء"
+                    logger.error(f"Notifier: Temporary failure sending to {chat_id}: {e}")
+            
+            # وضع علامة "مقروء" على كل الإشعارات التي تمت معالجتها
+            if sent_ids:
+                await conn.execute(
+                    "UPDATE notifications SET is_read = true WHERE id = ANY($1::bigint[])",
+                    sent_ids
+                )
+
+    except Exception as e:
+        logger.error(f"Notifier: Critical error in fetch_and_send loop: {e}", exc_info=True)
+
+async def main_loop():
+    """
+    الحلقة الرئيسية التي تعمل باستمرار.
+    """
+    if not TELEGRAM_BOT_TOKEN:
+        logger.critical("TELEGRAM_BOT_TOKEN not set! Notifier cannot start.")
+        return
+        
+    await get_db_pool() # تهيئة الاتصال
+    bot = Bot(token=TELEGRAM_BOT_TOKEN)
+    
+    logger.info("--- 🚀 Telegram Notifier Service (V4.1) Started ---")
+    
+    while True:
+        await fetch_and_send_notifications(bot)
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main_loop())
+    except KeyboardInterrupt:
+        logger.info("--- 🛑 Telegram Notifier Service Shutting Down... ---")
+    finally:
+        if POOL:
+            asyncio.run(POOL.close())
+
+}
+
+{
+type: uploaded file
+fileName: main (1).py
+fullContent:
+import uvicorn
+import asyncio
+import logging
+import os
+import aiohttp
+import ccxt.async_support as ccxt
+from fastapi import FastAPI, Request, Depends, HTTPException, WebSocket, Body, Header
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from typing import Dict, Any, List, Optional
+from uuid import UUID
+from contextlib import asynccontextmanager
+from datetime import datetime
+
+# --- استيراد الوحدات الجديدة ---
+import db_utils
+from db_utils import UserKeys, TradingVariables, BotSettings
+
+# --- إعداد FastAPI ---
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger("FastAPIServer_V4_Paywall")
+
+app = FastAPI(title="Trading Bot SaaS Platform (V4 - Paywall Enabled)")
+
+# --- (التخزين المؤقت للاتصالات) ---
+USER_CCXT_CACHE: Dict[UUID, ccxt.Exchange] = {}
+CCXT_CACHE_LOCK = asyncio.Lock()
+
+@asynccontextmanager
+async def get_ccxt_connection(user_id: UUID) -> ccxt.Exchange:
+    """يدير اتصالات CCXT المخبأة لجلب الأرصدة بسرعة."""
+    async with CCXT_CACHE_LOCK:
+        if user_id in USER_CCXT_CACHE:
+            logger.info(f"API: Using cached CCXT connection for user {user_id}")
+            yield USER_CCXT_CACHE[user_id]
+            return
+    
+    logger.info(f"API: Creating new CCXT connection for user {user_id}...")
+    keys = await db_utils.get_user_api_keys(user_id)
+    if not keys:
+        raise HTTPException(status_code=404, detail="User API keys not found or invalid.")
+        
+    exchange = None
+    try:
+        exchange = ccxt.binance({
+            'apiKey': keys.api_key, 'secret': keys.api_secret,
+            'enableRateLimit': True, 'options': {'defaultType': 'spot'}
+        })
+        await exchange.load_markets()
+        async with CCXT_CACHE_LOCK:
+            USER_CCXT_CACHE[user_id] = exchange
+        yield exchange
+    except Exception as e:
+        logger.error(f"API: Failed to create CCXT connection for {user_id}: {e}")
+        async with CCXT_CACHE_LOCK:
+            if user_id in USER_CCXT_CACHE: del USER_CCXT_CACHE[user_id]
+        raise HTTPException(status_code=500, detail=f"Failed to initialize exchange connection: {str(e)}")
+    finally:
+        pass # يبقى الاتصال في الذاكرة المؤقتة
+
+async def close_all_cached_connections():
+    async with CCXT_CACHE_LOCK:
+        logger.info("API: Closing all cached CCXT connections...")
+        for exchange in USER_CCXT_CACHE.values():
+            await exchange.close()
+        USER_CCXT_CACHE.clear()
+
+# =======================================================================================
+# --- [ ⬇️ القفل رقم 1 (V4) ⬇️ ] ---
+# --- المصادقة + التحقق من الاشتراك (Paywall) ---
+# =======================================================================================
+
+async def get_user_from_token(authorization: str = Header(None)) -> UUID:
+    """(الخطوة 1) يتحقق من التوكن ويرجع الـ User ID."""
+    if authorization is None:
+        raise HTTPException(status_code=401, detail="Authorization header missing.")
+    try:
+        token_type, token = authorization.split(" ")
+        if token_type.lower() != "bearer": raise ValueError("Invalid token type")
+        user_uuid = UUID(token)
+        return user_uuid
+    except (ValueError, TypeError) as e:
+        logger.warning(f"Auth Error: Invalid token format. {e}")
+        raise HTTPException(status_code=401, detail="Invalid authorization token.")
+
+async def get_active_user(user_id: UUID = Depends(get_user_from_token)) -> UUID:
+    """
+    (الخطوة 2: "حارس البوابة")
+    يتحقق مما إذا كان المستخدم لديه اشتراك ساري.
+    هذا هو "القفل" الذي يمنع الاستخدام غير المصرح به.
+    """
+    try:
+        settings = await db_utils.get_user_settings_by_id(user_id)
+        if not settings:
+            logger.warning(f"Auth: No settings found for user {user_id}. Denying access.")
+            raise HTTPException(status_code=403, detail="User profile not found. Please contact support.")
+
+        status = settings.subscription_status
+        expires_at = settings.subscription_expires_at
+
+        if status in ('active', 'trial') and expires_at > datetime.now(datetime.timezone.utc):
+            # ✅ المستخدم مصرح له
+            return user_id
+        elif status == 'pending_payment':
+            logger.info(f"Auth: Access denied for {user_id}. Status: pending_payment.")
+            raise HTTPException(status_code=403, detail="اشتراكك قيد المراجعة. يرجى الانتظار.")
+        elif status == 'expired':
+            logger.info(f"Auth: Access denied for {user_id}. Status: expired.")
+            raise HTTPException(status_code=403, detail="انتهى اشتراكك. الرجاء التجديد.")
+        else:
+            logger.info(f"Auth: Access denied for {user_id}. Status: {status}.")
+            raise HTTPException(status_code=403, detail="حسابك غير نشط. يرجى الاتصال بالدعم.")
+
+    except HTTPException as e:
+        raise e # إعادة إرسال أخطاء 401/403
+    except Exception as e:
+        logger.error(f"Auth: Error checking subscription for user {user_id}: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error while checking subscription.")
+
+
+# =======================================================================================
+# --- واجهات برمجة التطبيقات (API Endpoints) ---
+# (الآن تستخدم `get_active_user` كـ "حارس بوابة")
+# =======================================================================================
+
+# --- 1. Bot Control ---
+@app.post("/bot/start", tags=["Bot Control"])
+async def start_bot(user_id: UUID = Depends(get_active_user)):
+    """(ينفذ /bot/start) - يشغل البوت للمستخدم (يتطلب اشتراك ساري)."""
+    logger.info(f"API: User {user_id} requested START")
+    settings = await db_utils.set_bot_status(user_id, True)
+    return {"status": "starting", "is_running": settings.is_running}
+
+@app.post("/bot/stop", tags=["Bot Control"])
+async def stop_bot(user_id: UUID = Depends(get_active_user)):
+    """(ينفذ /bot/stop) - يوقف البوت للمستخدم (يتطلب اشتراك ساري)."""
+    logger.info(f"API: User {user_id} requested STOP")
+    settings = await db_utils.set_bot_status(user_id, False)
+    return {"status": "stopping", "is_running": settings.is_running}
+
+@app.get("/bot/status", tags=["Bot Control"])
+async def get_bot_status(user_id: UUID = Depends(get_user_from_token)):
+    """(ينفذ /bot/status) - يجلب حالة البوت (لا يتطلب اشتراك ساري)."""
+    settings = await db_utils.get_user_settings_by_id(user_id)
+    if not settings:
+         raise HTTPException(status_code=404, detail="User settings not found.")
+    return {
+        "status": "running" if settings.is_running else "offline", 
+        "is_running": settings.is_running, 
+        "current_preset_name": settings.current_preset_name,
+        # [جديد V4] إرسال حالة الاشتراك للواجهة
+        "subscription_status": settings.subscription_status,
+        "subscription_expires_at": settings.subscription_expires_at
+    }
+
+# --- 2. Balance & Keys ---
+@app.get("/bot/balance", tags=["Balance & Keys"])
+async def get_balance(user_id: UUID = Depends(get_active_user)):
+    """(ينفذ /bot/balance) - يجلب الرصيد (يتطلب اشتراك ساري)."""
+    try:
+        async with get_ccxt_connection(user_id) as exchange:
+            balance = await exchange.fetch_balance()
+            usdt_balance = balance.get('USDT', {})
+            return {"total_balance": usdt_balance.get('total', 0), "available_balance": usdt_balance.get('free', 0), "currency": "USDT"}
+    except HTTPException as e: raise e
+    except Exception as e:
+        logger.error(f"API /balance error for user {user_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+class KeysPayload(BaseModel):
+    api_key: str; secret_key: str; passphrase: Optional[str] = None
+
+@app.post("/bot/test-keys", tags=["Balance & Keys"])
+async def test_binance_keys(payload: KeysPayload, user_id: UUID = Depends(get_user_from_token)):
+    """(ينفذ /bot/test-keys) - يختبر ويحفظ المفاتيح (لا يتطلب اشتراك ساري)."""
+    logger.info(f"API: User {user_id} testing keys...")
+    try:
+        test_exchange = ccxt.binance({'apiKey': payload.api_key, 'secret': payload.secret_key, 'enableRateLimit': True})
+        await test_exchange.fetch_balance()
+        await test_exchange.close()
+        await db_utils.save_api_keys(user_id, payload.api_key, payload.secret_key, payload.passphrase)
+        await db_utils.set_api_keys_valid(user_id, True)
+        return {"status": "success", "message": "تم اختبار وحفظ المفاتيح بنجاح."}
+    except Exception as e:
+        logger.error(f"API /test-keys error for user {user_id}: {e}")
+        await db_utils.save_api_keys(user_id, payload.api_key, payload.secret_key, payload.passphrase) # حفظها كغير صالحة
+        await db_utils.set_api_keys_valid(user_id, False)
+        raise HTTPException(status_code=400, detail=f"فشل اختبار المفاتيح: {str(e)}")
+
+# (هذا المسار أصبح غير ضروري لأن /bot/test-keys يقوم بالحفظ)
+# @app.post("/keys", tags=["Balance & Keys"]) ...
+
+# --- 3. Trades ---
+@app.get("/trades/active", tags=["Trades"])
+async def get_active_trades(user_id: UUID = Depends(get_active_user)):
+    return await db_utils.get_active_trades(user_id)
+
+class CloseTradePayload(BaseModel):
+    trade_id: int
+
+@app.post("/trades/close", tags=["Trades"])
+async def close_trade(payload: CloseTradePayload, user_id: UUID = Depends(get_active_user)):
+    success = await db_utils.flag_trade_for_closure(user_id, payload.trade_id)
+    if not success: raise HTTPException(status_code=404, detail="Trade not found or not active.")
+    return {"status": "closing", "message": "تم إرسال أمر الإغلاق إلى العامل."}
+
+@app.get("/trades/history", tags=["Trades"])
+async def get_trades_history(limit: int = 50, user_id: UUID = Depends(get_active_user)):
+    return await db_utils.get_trades_history(user_id, limit)
+
+@app.get("/trades/stats", tags=["Trades"])
+async def get_trades_stats(user_id: UUID = Depends(get_active_user)):
+    return await db_utils.get_trades_stats(user_id)
+
+# --- 4. Strategies (Scanners) ---
+@app.get("/strategies", tags=["Strategies & Scanners"])
+async def get_strategies(user_id: UUID = Depends(get_active_user)):
+    async with db_utils.db_connection() as conn:
+        records = await conn.fetch("SELECT * FROM strategies WHERE user_id = $1", user_id)
+    return [dict(r) for r in records]
+
+@app.post("/strategies/{strategy_name}/toggle", tags=["Strategies & Scanners"])
+async def toggle_strategy(strategy_name: str, enabled_payload: dict = Body(...), user_id: UUID = Depends(get_active_user)):
+    is_enabled = enabled_payload.get('enabled', False)
+    async with db_utils.db_connection() as conn:
+        await conn.execute("UPDATE strategies SET is_enabled = $1 WHERE user_id = $2 AND strategy_name = $3", is_enabled, user_id, strategy_name)
+    return {"status": "success", "strategy_name": strategy_name, "is_enabled": is_enabled}
+
+@app.get("/scanners", tags=["Strategies & Scanners"])
+async def get_scanners(user_id: UUID = Depends(get_active_user)):
+    return await get_strategies(user_id)
+
+@app.post("/scanners/{scanner_name}/toggle", tags=["Strategies & Scanners"])
+async def toggle_scanner(scanner_name: str, enabled_payload: dict = Body(...), user_id: UUID = Depends(get_active_user)):
+    return await toggle_strategy(scanner_name, enabled_payload, user_id)
+
+# --- 5. Settings & Presets ---
+@app.get("/settings", tags=["Settings & Presets"])
+async def get_bot_settings(user_id: UUID = Depends(get_user_from_token)):
+    """(يجلب الإعدادات المتقدمة - لا يتطلب اشتراك ساري)"""
+    settings = await db_utils.get_api_settings(user_id)
+    if not settings: 
+        # (إذا لم تكن موجودة، قم بإنشاء إعدادات افتراضية)
+        logger.info(f"Creating default advanced_variables for user {user_id}")
+        async with db_utils.db_connection() as conn:
+            await conn.execute("INSERT INTO advanced_variables (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING", user_id)
+        settings = await db_utils.get_api_settings(user_id)
+    return settings
+
+@app.post("/settings", tags=["Settings & Presets"])
+async def update_bot_settings(settings: Dict[str, Any], user_id: UUID = Depends(get_active_user)):
+    """(يحدّث الإعدادات المتقدمة - يتطلب اشتراك ساري)"""
+    settings.pop('id', None); settings.pop('user_id', None); settings.pop('updated_at', None)
+    success = await db_utils.update_api_settings(user_id, settings)
+    if not success: raise HTTPException(status_code=500, detail="Failed to update settings.")
+    return {"status": "success", "message": "تم تحديث الإعدادات بنجاح."}
+
+class PresetPayload(BaseModel):
+    preset_name: str
+
+@app.post("/settings/preset", tags=["Settings & Presets"])
+async def change_preset(payload: PresetPayload, user_id: UUID = Depends(get_active_user)):
+    logger.info(f"API: User {user_id} applying preset '{payload.preset_name}'")
+    #
+    preset_definitions = {
+        'strict': {"risk_reward_ratio": 3.0, "max_concurrent_trades": 2, "max_daily_loss_pct": 2.0},
+        'professional': {"risk_reward_ratio": 2.5, "max_concurrent_trades": 3, "max_daily_loss_pct": 3.0},
+        'lenient': {"risk_reward_ratio": 2.0, "max_concurrent_trades": 5, "max_daily_loss_pct": 5.0},
+        'very_lenient': {"risk_reward_ratio": 1.5, "max_concurrent_trades": 7, "max_daily_loss_pct": 7.0},
+        'bold_heart': {"risk_reward_ratio": 1.2, "max_concurrent_trades": 10, "max_daily_loss_pct": 10.0}
+    }
+    settings_to_apply = preset_definitions.get(payload.preset_name)
+    if not settings_to_apply: raise HTTPException(status_code=404, detail="Preset not found.")
+    
+    success = await db_utils.apply_preset_settings(user_id, payload.preset_name, settings_to_apply)
+    if not success: raise HTTPException(status_code=500, detail="Failed to apply preset.")
+    return {"status": "success", "message": f"تم تطبيق نمط '{payload.preset_name}' بنجاح."}
+
+# --- 6. Notifications & Health ---
+@app.get("/notifications", tags=["Notifications & Health"])
+async def get_notifications(limit: int = 50, unread_only: bool = False, user_id: UUID = Depends(get_user_from_token)):
+    """(يجلب الإشعارات - لا يتطلب اشتراك ساري)"""
+    return await db_utils.get_notifications(user_id, limit, unread_only)
+
+@app.post("/notifications/{notification_id}/read", tags=["Notifications & Health"])
+async def mark_notification_read(notification_id: int, user_id: UUID = Depends(get_user_from_token)):
+    success = await db_utils.mark_notification_read(user_id, notification_id)
+    if not success: raise HTTPException(status_code=404, detail="Notification not found.")
+    return {"status": "success"}
+
+@app.get("/health", tags=["Notifications & Health"])
+async def health_check():
+    return {"status": "ok", "timestamp": datetime.now().isoformat()}
+
+# =======================================================================================
+# --- [ ⬇️ جديد V4 ⬇️ ] واجهات برمجة التطبيقات الخاصة بالتليجرام والاشتراكات ---
+# =======================================================================================
+
+class TelegramLinkPayload(BaseModel):
+    telegram_chat_id: int
+
+@app.post("/telegram/link-account", tags=["V4 - User Setup"])
+async def link_telegram_account(payload: TelegramLinkPayload, user_id: UUID = Depends(get_user_from_token)):
+    """(لتنفيذ فكرتك) يربط معرف تليجرام بحساب الويب."""
+    logger.info(f"API: User {user_id} linking to Telegram ID {payload.telegram_chat_id}")
+    success = await db_utils.update_user_telegram_id(user_id, payload.telegram_chat_id)
+    if not success:
+        raise HTTPException(status_code=400, detail="This Telegram account is already linked to another user.")
+    return {"status": "success", "message": "تم ربط حساب تليجرام بنجاح."}
+
+class PaymentPayload(BaseModel):
+    txt_id: str
+    subscription_plan: str
+    wallet_address_used: str
+    amount_paid: float
+
+@app.post("/payment/submit-txtid", tags=["V4 - User Setup"])
+async def submit_payment_txtid(payload: PaymentPayload, user_id: UUID = Depends(get_user_from_token)):
+    """(لتنفيذ فكرتك) يسجل طلب الدفع اليدوي للمراجعة."""
+    logger.info(f"API: User {user_id} submitting payment TXT_ID {payload.txt_id}")
+    success = await db_utils.create_payment_request(
+        user_id, payload.txt_id, payload.subscription_plan, 
+        payload.wallet_address_used, payload.amount_paid
+    )
+    if not success:
+        raise HTTPException(status_code=400, detail="تم إرسال معرف المعاملة هذا من قبل.")
+    return {"status": "success", "message": "تم استلام طلب الدفع، جاري المراجعة."}
+
+# =======================================================================================
+# --- واجهات برمجة التطبيقات الخاصة بـ Telegram (القديمة من V3) ---
+# --- (الآن تستخدم "حارس البوابة" `get_active_user`) ---
+# =======================================================================================
+
+@app.get("/telegram/mood", tags=["Telegram API"])
+async def get_telegram_mood(user_id: UUID = Depends(get_active_user)):
+    """(يحاكي show_mood_command) يجلب مزاج السوق."""
+    try:
+        fng_index = 50
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://api.alternative.me/fng/?limit=1") as resp:
+                if resp.status == 200: fng_index = int((await resp.json())['data'][0]['value'])
+        
+        btc_mood = "غير معروف"
+        async with get_ccxt_connection(user_id) as exchange: # استخدام اتصال المستخدم
+            ohlcv = await exchange.fetch_ohlcv('BTC/USDT', '4h', limit=50)
+            if ohlcv and len(closes := [c[4] for c in ohlcv]) > 40:
+                sma_40 = sum(closes[-40:]) / 40
+                btc_mood = "صاعد ✅" if closes[-1] > sma_40 else "هابط ❌"
+        
+        return {"verdict": "المؤشرات إيجابية، لكن بحذر.", "btc_mood": btc_mood, "fng_index": fng_index, "news_sentiment": "محايدة"}
+    except Exception as e:
+        logger.error(f"API /telegram/mood error: {e}")
+        raise HTTPException(status_code=500, detail="فشل جلب بيانات المزاج")
+
+@app.get("/telegram/diagnostics", tags=["Telegram API"])
+async def get_telegram_diagnostics(user_id: UUID = Depends(get_active_user)):
+    """(يحاكي show_diagnostics_command) يجلب تقرير التشخيص."""
+    try:
+        settings = await db_utils.get_api_settings(user_id)
+        stats = await db_utils.get_trades_stats(user_id)
+        
+        scanners_list = []
+        async with db_utils.db_connection() as conn:
+            records = await conn.fetch("SELECT display_name, is_enabled FROM strategies WHERE user_id = $1", user_id)
+            for r in records: scanners_list.append(f"  - {r['display_name']}: {'✅' if r['is_enabled'] else '❌'}")
+        
+        bot_status = await db_utils.get_user_settings_by_id(user_id)
+        
+        return {
+            "timestamp": datetime.now().isoformat(), "api_status": "ناجح ✅", "db_status": "ناجح ✅",
+            "active_preset_name": bot_status.current_preset_name,
+            "subscription_status": bot_status.subscription_status,
+            "subscription_expires_at": bot_status.subscription_expires_at.isoformat(),
+            "active_scanners_report": "\n".join(scanners_list),
+            "total_closed_trades": stats.get('total_trades', 0)
+        }
+    except Exception as e:
+        logger.error(f"API /telegram/diagnostics error: {e}")
+        raise HTTPException(status_code=500, detail="فشل جلب بيانات التشخيص")
+
+# =======================================================================================
+# --- خدمة واجهة الويب (Web UI) ---
+#
+# =======================================================================================
+
+UI_BUILD_DIR = os.path.join(os.path.dirname(__file__), "dist")
+
+if not os.path.exists(UI_BUILD_DIR):
+    logger.warning("="*50)
+    logger.warning("UI build directory 'dist' not found.")
+    logger.warning(f"Expected at: {UI_BUILD_DIR}")
+    logger.warning("Web UI will not be served.")
+    logger.warning("="*50)
+else:
+    app.mount("/assets", StaticFiles(directory=os.path.join(UI_BUILD_DIR, "assets")), name="assets")
+    
+    @app.get("/{full_path:path}", response_class=HTMLResponse, include_in_schema=False)
+    async def serve_react_app(request: Request, full_path: str):
+        index_path = os.path.join(UI_BUILD_DIR, "index.html")
+        if not os.path.exists(index_path):
+            return HTMLResponse("<h1>Frontend build files (dist/index.html) not found.</h1>", status_code=404)
+        
+        return FileResponse(index_path)
+
+# =======================================================================================
+# --- أحداث بدء وإيقاف التشغيل ---
+# =======================================================================================
+
+@app.on_event("startup")
+async def on_startup():
+    await db_utils.get_db_pool()
+    try: await PUBLIC_EXCHANGE.load_markets()
+    except Exception as e: logger.error(f"Failed to load PUBLIC_EXCHANGE markets: {e}")
+    logger.info("--- 🚀 FastAPI Server Started (V4 - Paywall Enabled) ---")
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    await close_all_cached_connections()
+    await PUBLIC_EXCHANGE.close()
+    if db_utils.POOL:
+        await db_utils.POOL.close()
+    logger.info("--- 🛑 FastAPI Server Shutdown ---")
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
+
 }
