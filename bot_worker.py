@@ -16,7 +16,7 @@ from db_utils import UserSettings, TradingVariables, ActiveStrategy, UserKeys, B
 
 # --- إعداد السجلات ---
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-logger = logging.getLogger("BotWorker_V2_2_Patched")
+logger = logging.getLogger("BotWorker_V4_Final")
 
 # --- (الثوابت والمخابئ كما هي) ---
 SCAN_INTERVAL_SECONDS = 900
@@ -138,7 +138,7 @@ async def run_public_websocket_manager():
             await asyncio.sleep(5)
 
 async def _manage_active_trade(trade: Dict, price: float):
-    """ (V2.1) دالة مساعدة لـ "العيون": تدير الوقف المتحرك والإشعارات "التافهة". """
+    """ (V4) دالة مساعدة لـ "العيون": تدير الوقف المتحرك والإشعارات "التافهة". """
     trade_id, user_id = trade['id'], trade['user_id']
     settings = await get_user_settings(user_id)
     if not settings: return
@@ -202,15 +202,17 @@ async def _manage_active_trade(trade: Dict, price: float):
                 asyncio.create_task(_run_wise_man_deep_analysis(trade, settings.model_dump()))
 
 async def sync_cache_from_db():
-    """(V2.1) يقوم بمزامنة ذاكرة التخزين المؤقت لـ "العيون" والإعدادات مع قاعدة البيانات."""
+    """(V4) يقوم بمزامنة ذاكرة التخزين المؤقت لـ "العيون" والإعدادات مع قاعدة البيانات."""
     global GLOBAL_ACTIVE_TRADES_CACHE, USER_SETTINGS_CACHE, USER_STRATEGIES_CACHE
     while True:
         try:
             logger.info("CACHE_SYNC: Syncing active trades and user settings...")
+            # [ ⬇️ القفل رقم 2 (V4) ⬇️ ]
+            # جلب المستخدمين الذين يريدون التداول + اشتراكهم ساري
             active_users = await db_utils.get_all_active_users()
             active_user_ids = {u.user_id for u in active_users}
             
-            # مزامنة الصفقات
+            # مزامنة الصفقات (فقط للمستخدمين النشطين)
             new_cache = {}
             all_trades_count = 0
             if active_user_ids:
@@ -262,7 +264,7 @@ async def run_supervisor():
         await asyncio.sleep(SUPERVISOR_INTERVAL_SECONDS)
 
 async def _execute_close(user_id: UUID, trade: Dict, reason: str):
-    """ (V2.1) ينفذ أمر البيع الفعلي ويحدّث قاعدة البيانات. """
+    """ (V4) ينفذ أمر البيع الفعلي ويحدّث قاعدة البيانات. """
     trade_id, symbol = trade['id'], trade['symbol']
     exchange = await get_user_exchange(user_id)
     if not exchange:
@@ -309,13 +311,14 @@ async def _execute_close(user_id: UUID, trade: Dict, reason: str):
 # =======================================================================================
 
 async def run_scanner():
-    """ (V2.1) "الماسح": يلف على جميع المستخدمين النشطين وينفذ الفحص لهم. """
+    """ (V4) "الماسح": يلف على جميع المستخدمين النشطين وينفذ الفحص لهم. """
     while True:
         logger.info("SCANNER: Starting new multi-user scan cycle...")
         try:
+            # [ ⬇️ القفل رقم 2 (V4) ⬇️ ]
             active_users = await db_utils.get_all_active_users()
             if not active_users:
-                logger.info("SCANNER: No active users found. Sleeping.")
+                logger.info("SCANNER: No active users with valid subscriptions found. Sleeping.")
                 await asyncio.sleep(SCAN_INTERVAL_SECONDS); continue
             
             logger.info(f"SCANNER: Found {len(active_users)} active users to scan for.")
@@ -329,7 +332,7 @@ async def run_scanner():
         await asyncio.sleep(SCAN_INTERVAL_SECONDS)
 
 async def scan_for_user(user_id: UUID, all_tickers: Dict):
-    """ (V2.2) [الإصلاح الحاسم] ينفذ الفحص مع التحقق من الرصيد والحد الأقصى قبل كل عملية شراء. """
+    """ (V5) [إصلاح الكنز] ينفذ الفحص مع التحقق من الرصيد والحد الأقصى قبل كل عملية شراء. """
     
     logger.info(f"SCANNER: Starting scan for user {user_id}...")
     scan_start_time = time.time()
@@ -349,7 +352,8 @@ async def scan_for_user(user_id: UUID, all_tickers: Dict):
         if not user_exchange:
             await _notify_scan_skip(user_id, "فشل الفحص: مفاتيح API غير صالحة أو مفقودة."); return
         
-        # 3. التحقق المبدئي من الرصيد والحد الأقصى للصفقات
+        # [ ⬇️ إصلاح الكنز V5 ⬇️ ]
+        # 3. جلب الرصيد والحد الأقصى للصفقات (مرة واحدة في البداية)
         try:
             balance = await user_exchange.fetch_balance()
             usdt_balance = balance.get('USDT', {}).get('free', 0.0)
@@ -363,6 +367,7 @@ async def scan_for_user(user_id: UUID, all_tickers: Dict):
         available_slots = settings.max_concurrent_trades - active_count
         if available_slots <= 0:
             await _notify_scan_skip(user_id, f"فحص متوقف: تم الوصول للحد الأقصى للصفقات ({active_count})."); return
+        # [ ⬆️ نهاية إصلاح الكنز V5 ⬆️ ]
 
         # 4. فلترة الأسواق (مزاج السوق، F&G، اتجاه BTC)
         if settings.market_mood_filter_enabled:
@@ -378,7 +383,7 @@ async def scan_for_user(user_id: UUID, all_tickers: Dict):
             and t.get('active', True)
         ]
         valid_markets.sort(key=lambda m: m.get('quoteVolume', 0), reverse=True)
-        symbols_to_scan = [m['symbol'] for m in valid_markets[:100]] # (يجب جلب هذا من settings)
+        symbols_to_scan = [m['symbol'] for m in valid_markets[:100]]
         if not symbols_to_scan: return
 
         # 6. جلب بيانات OHLCV
@@ -388,7 +393,7 @@ async def scan_for_user(user_id: UUID, all_tickers: Dict):
 
         # 7. تشغيل الماسحات
         for symbol, ohlcv in ohlcv_data.items():
-            # --- [الإصلاح الحاسم (منطق الكنز)] ---
+            # [ ⬇️ إصلاح الكنز V5 ⬇️ ]
             # التحقق من "فتحات الصفقات" المتاحة داخل الحلقة
             if available_slots <= 0:
                 logger.info(f"SCANNER ({user_id}): No more available trade slots. Stopping scan for user.")
@@ -400,8 +405,6 @@ async def scan_for_user(user_id: UUID, all_tickers: Dict):
             try:
                 df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 if len(df) < 50: continue
-                
-                # (يجب إضافة كل الفلاتر: ATR, Volume, ADX, EMA ... إلخ)
                 
                 confirmed_reasons = []
                 for strategy in strategies:
@@ -429,28 +432,21 @@ async def scan_for_user(user_id: UUID, all_tickers: Dict):
                     
                     signal = {"symbol": symbol, "entry_price": entry_price, "take_profit": take_profit, "stop_loss": stop_loss, "reason": ' + '.join(set(confirmed_reasons))}
                     
-                    # --- [الإصلاح الحاسم (منطق الكنز)] ---
+                    # --- [ ⬇️ إصلاح الكنز V5 ⬇️ ] ---
                     # التحقق من الرصيد الفعلي *قبل* الشراء مباشرة
-                    try:
-                        balance = await user_exchange.fetch_balance()
-                        usdt_balance = balance.get('USDT', {}).get('free', 0.0)
-                        required_size = settings.min_trade_amount
-                        
-                        if usdt_balance < required_size:
-                            logger.warning(f"SCANNER ({user_id}): Signal for {symbol}, but skipping. Insufficient balance ({usdt_balance} < {required_size}).")
-                            # إيقاف البحث عن صفقات لهذا المستخدم إذا نفد الرصيد
-                            break
-                        
-                        # الرصيد كافٍ، قم بالشراء
-                        if await _execute_buy(user_exchange, user_id, signal, settings):
-                            available_slots -= 1
-                            trades_opened_count += 1
-                            await asyncio.sleep(1) # إعطاء فرصة لتحديث الرصيد
+                    required_size = settings.min_trade_amount
+                    if usdt_balance < required_size:
+                        logger.warning(f"SCANNER ({user_id}): Signal for {symbol}, but skipping. Insufficient balance ({usdt_balance} < {required_size}).")
+                        break # إيقاف البحث عن صفقات لهذا المستخدم
+                    
+                    # الرصيد كافٍ، قم بالشراء
+                    if await _execute_buy(user_exchange, user_id, signal, settings):
+                        available_slots -= 1
+                        trades_opened_count += 1
+                        usdt_balance -= required_size # (تحديث الرصيد الوهمي)
+                        await asyncio.sleep(1) # إعطاء فرصة لتحديث الرصيد
 
-                    except Exception as e:
-                        logger.error(f"SCANNER ({user_id}): Error during pre-buy balance check for {symbol}: {e}")
-                        analysis_errors_count += 1
-                    # --- [نهاية الإصلاح] ---
+                    # --- [ ⬆️ نهاية إصلاح الكنز V5 ⬆️ ] ---
             
             except Exception as e:
                 logger.error(f"SCANNER: Error processing symbol {symbol} for user {user_id}: {e}")
@@ -477,13 +473,13 @@ async def scan_for_user(user_id: UUID, all_tickers: Dict):
 async def _notify_scan_skip(user_id: UUID, reason: str):
     """(V2.1) يرسل إشعار تخطي الفحص مرة واحدة فقط."""
     if SCAN_SKIP_NOTIFICATION_CACHE.get(user_id) == reason:
-        return # تم إرسال هذا الإشعار من قبل
+        return
     logger.info(f"SCANNER: {reason} (User: {user_id})")
     await db_utils.create_notification(user_id, "⚠️ تم تخطي الفحص", reason, "warning")
     SCAN_SKIP_NOTIFICATION_CACHE[user_id] = reason
 
 async def _execute_buy(exchange: ccxt.Exchange, user_id: UUID, signal: dict, settings: TradingVariables) -> bool:
-    """ (V2.1) ينفذ الشراء ويسجل الصفقة. """
+    """ (V4) ينفذ الشراء ويسجل الصفقة. """
     symbol = signal['symbol']
     trade_size = settings.min_trade_amount
     try:
@@ -517,7 +513,7 @@ async def _execute_buy(exchange: ccxt.Exchange, user_id: UUID, signal: dict, set
             logger.critical(f"BUYER ({user_id}): Failed to log active trade for {symbol}. Cancelling order {buy_order['id']}.")
             await exchange.cancel_order(buy_order['id'], symbol); return False
     except ccxt.InsufficientFunds:
-        logger.error(f"BUYER ({user_id}): Insufficient funds for {symbol}."); return False # (الإصلاح الحاسم سيمنع هذا)
+        logger.error(f"BUYER ({user_id}): Insufficient funds for {symbol}."); return False
     except Exception as e:
         logger.error(f"BUYER ({user_id}): Failed to execute buy for {symbol}: {e}", exc_info=True); return False
 
@@ -572,7 +568,7 @@ async def _run_smart_engine_analysis(exchange: ccxt.Exchange, closed_trade: Dict
 # =======================================================================================
 
 async def main():
-    logger.info("--- 🚀 Bot Worker (SaaS Engine V2.2 - Patched) Starting Up... ---")
+    logger.info("--- 🚀 Bot Worker (SaaS Engine V4.0 - Paywall + Treasure Fix) Starting Up... ---")
     await db_utils.get_db_pool()
     await PUBLIC_EXCHANGE.load_markets()
     tasks = [
