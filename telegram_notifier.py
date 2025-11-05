@@ -48,23 +48,24 @@ async def fetch_and_send_notifications(bot: Bot):
             # جلب الإشعارات غير المقروءة مع ربطها بجدول المستخدمين لجلب chat_id
             notifications = await conn.fetch(
                 """
-                SELECT 
-                    n.id, 
-                    n.user_id, 
-                    n.title, 
-                    n.message, 
-                    n.type,
-                    p.telegram_chat_id
-                FROM 
-                    notifications AS n
-                JOIN 
-                    user_profiles AS p ON n.user_id = p.user_id
-                WHERE 
-                    n.is_read = false
-                ORDER BY 
-                    n.timestamp ASC
-                LIMIT 50; -- (إرسال 50 رسالة كحد أقصى في كل دورة)
-                """
+               SELECT 
+                n.id, 
+                n.user_id, 
+                n.title, 
+                n.message, 
+                n.type,
+                s.telegram_chat_id
+            FROM 
+                notifications AS n
+            JOIN 
+                user_settings AS s ON n.user_id = s.user_id
+            WHERE 
+                n.is_read = false 
+                AND s.telegram_chat_id IS NOT NULL
+            ORDER BY 
+                n.timestamp ASC
+            LIMIT 50;
+             """
             )
             
             if not notifications:
