@@ -18,6 +18,9 @@ class BotSettings(BaseModel):
     user_id: UUID
     is_running: bool
     current_preset_name: str
+    subscription_status: str
+    subscription_expires_at: datetime
+    telegram_chat_id: Optional[int] = None
 
 class TradingVariables(BaseModel):
     user_id: UUID
@@ -83,11 +86,24 @@ async def db_connection():
 # =================================================================
 
 async def get_all_active_users() -> List[BotSettings]:
+    """
+    [ ⬇️ القفل رقم 2 (V4) ⬇️ ]
+    (للعامل) يجلب جميع المستخدمين الذين هم 'قيد التشغيل' واشتراكهم 'ساري'.
+    """
     async with db_connection() as conn:
-        records = await conn.fetch("SELECT user_id, is_running, current_preset_name FROM user_settings WHERE is_running = true")
+        records = await conn.fetch(
+            """
+            SELECT user_id, is_running, current_preset_name, subscription_status, subscription_expires_at, telegram_chat_id 
+            FROM user_settings 
+            WHERE is_running = true 
+              AND subscription_status = 'active'
+              AND subscription_expires_at > NOW()
+            """
+        )
         return [BotSettings(**dict(r)) for r in records]
 
 async def get_user_api_keys(user_id: UUID) -> Optional[UserKeys]:
+    """(للعامل والخادم) يجلب مفاتيح المستخدم لإنشاء اتصال CCXT."""
     async with db_connection() as conn:
         record = await conn.fetchrow("SELECT api_key_encrypted, api_secret_encrypted, passphrase_encrypted FROM user_api_keys WHERE user_id = $1 AND is_valid = true", user_id)
         if not record:
@@ -101,6 +117,7 @@ async def get_user_api_keys(user_id: UUID) -> Optional[UserKeys]:
         )
 
 async def get_user_trading_variables(user_id: UUID) -> Optional[TradingVariables]:
+    """(للعامل) يجلب إعدادات التداول المتقدمة للمستخدم."""
     async with db_connection() as conn:
         record = await conn.fetchrow("SELECT * FROM advanced_variables WHERE user_id = $1", user_id)
         if record:
@@ -111,18 +128,19 @@ async def get_user_trading_variables(user_id: UUID) -> Optional[TradingVariables
         return None
 
 async def get_user_enabled_strategies(user_id: UUID) -> List[ActiveStrategy]:
+    """(للعامل) يجلب الاستراتيجيات المفعلة فقط للمستخدم."""
     async with db_connection() as conn:
         records = await conn.fetch("SELECT strategy_name, parameters FROM strategies WHERE user_id = $1 AND is_enabled = true", user_id)
         return [ActiveStrategy(strategy_name=r['strategy_name'], parameters=json.loads(r['parameters'] or '{}')) for r in records]
 
 async def create_trade(user_id: UUID, symbol: str, reason: str, entry_price: float, qty: float, tp: float, sl: float, order_id: str) -> Optional[Dict]:
+    """(للعامل) يسجل صفقة جديدة في قاعدة البيانات (V4 - مع حقول TSL)."""
     try:
         async with db_connection() as conn:
-            # [تصحيح] إضافة highest_price عند الإنشاء
             new_trade = await conn.fetchrow(
                 """
-                INSERT INTO trades (user_id, symbol, status, reason, entry_price, quantity, take_profit, stop_loss, order_id, opened_at, highest_price, last_profit_notification_price)
-                VALUES ($1, $2, 'active', $3, $4, $5, $6, $7, $8, NOW(), $4, $4) -- (highest_price = entry_price)
+                INSERT INTO trades (user_id, symbol, status, reason, entry_price, quantity, take_profit, stop_loss, order_id, opened_at, highest_price, last_profit_notification_price, trailing_sl_active)
+                VALUES ($1, $2, 'active', $3, $4, $5, $6, $7, $8, NOW(), $4, $4, false) -- (highest_price = entry_price)
                 RETURNING *
                 """,
                 user_id, symbol, reason, entry_price, qty, tp, sl, order_id
@@ -133,6 +151,7 @@ async def create_trade(user_id: UUID, symbol: str, reason: str, entry_price: flo
         return None
 
 async def close_trade(trade_id: int, exit_price: float, pnl: float) -> Optional[Dict]:
+    """(للعامل) يغلق صفقة ويسجل النتائج."""
     try:
         async with db_connection() as conn:
             closed_trade = await conn.fetchrow(
@@ -150,6 +169,7 @@ async def close_trade(trade_id: int, exit_price: float, pnl: float) -> Optional[
         return None
 
 async def create_notification(user_id: UUID, title: str, message: str, type: str = 'info', trade_id: Optional[int] = None):
+    """(ل للعامل) يسجل إشعاراً جديداً للمستخدم ليراه في الواجهة."""
     try:
         async with db_connection() as conn:
             await conn.execute(
@@ -164,6 +184,7 @@ async def create_notification(user_id: UUID, title: str, message: str, type: str
 
 # =================================================================
 # --- [تم الإصلاح] - دوال إدارة الصفقات المفقودة (V2.1) ---
+# --- (هذه هي دوال "كل فسفوسة") ---
 # =================================================================
 
 async def set_trade_status(trade_id: int, status: str):
@@ -174,75 +195,85 @@ async def set_trade_status(trade_id: int, status: str):
 async def update_trade_highest_price(trade_id: int, new_highest_price: float):
     """(لـ "العيون") يحدّث أعلى سعر وصلت له الصفقة."""
     async with db_connection() as conn:
-        await conn.execute(
-            "UPDATE trades SET highest_price = $1 WHERE id = $2 AND $1 > highest_price",
-            new_highest_price, trade_id
-        )
+        await conn.execute("UPDATE trades SET highest_price = $1 WHERE id = $2 AND $1 > highest_price", new_highest_price, trade_id)
 
 async def update_trade_after_tsl_activation(trade_id: int, new_stop_loss: float):
     """(لـ "العيون") يفعل الوقف المتحرك ويرفع الـ SL لنقطة الدخول."""
     async with db_connection() as conn:
-        await conn.execute(
-            "UPDATE trades SET trailing_sl_active = true, stop_loss = $1 WHERE id = $2 AND stop_loss < $1",
-            new_stop_loss, trade_id
-        )
+        await conn.execute("UPDATE trades SET trailing_sl_active = true, stop_loss = $1 WHERE id = $2 AND stop_loss < $1", new_stop_loss, trade_id)
 
 async def update_trade_tsl(trade_id: int, new_stop_loss: float):
     """(لـ "العيون") يحدّث الـ SL المتحرك."""
     async with db_connection() as conn:
-        await conn.execute(
-            "UPDATE trades SET stop_loss = $1 WHERE id = $2 AND stop_loss < $1",
-            new_stop_loss, trade_id
-        )
+        await conn.execute("UPDATE trades SET stop_loss = $1 WHERE id = $2 AND stop_loss < $1", new_stop_loss, trade_id)
 
 async def update_trade_profit_notification(trade_id: int, current_price: float):
     """(لـ "العيون") يحدّث آخر سعر تم إرسال إشعار ربح عنه."""
     async with db_connection() as conn:
-        await conn.execute(
-            "UPDATE trades SET last_profit_notification_price = $1 WHERE id = $2",
-            current_price, trade_id
-        )
+        await conn.execute("UPDATE trades SET last_profit_notification_price = $1 WHERE id = $2", current_price, trade_id)
 
 async def update_trade_take_profit(trade_id: int, new_take_profit: float):
     """(لـ WiseMan) يمدد هدف الربح."""
     async with db_connection() as conn:
-        await conn.execute(
-            "UPDATE trades SET take_profit = $1 WHERE id = $2 AND take_profit < $1",
-            new_take_profit, trade_id
-        )
+        await conn.execute("UPDATE trades SET take_profit = $1 WHERE id = $2 AND take_profit < $1", new_take_profit, trade_id)
+
 
 # =================================================================
 # --- دوال للخادم (API Server) ---
-# (هذه تبقى كما هي من V2)
 # =================================================================
 
+async def get_user_settings_by_id(user_id: UUID) -> Optional[BotSettings]:
+    """(جديد V4) يجلب إعدادات المستخدم الكاملة بما في ذلك حالة الاشتراك."""
+    async with db_connection() as conn:
+        record = await conn.fetchrow(
+            "SELECT * FROM user_settings WHERE user_id = $1", user_id
+        )
+        if record:
+            return BotSettings(**dict(record))
+        
+        # [جديد V4] إنشاء إعدادات افتراضية (تجريبية) إذا لم تكن موجودة
+        logger.info(f"Creating default 'trial' settings for new user {user_id}")
+        record = await conn.fetchrow(
+            """
+            INSERT INTO user_settings (user_id, is_running, subscription_status, subscription_expires_at)
+            VALUES ($1, false, 'trial', NOW() + INTERVAL '7 days')
+            ON CONFLICT (user_id) DO NOTHING
+            RETURNING *
+            """,
+            user_id
+        )
+        if record:
+            return BotSettings(**dict(record))
+        # (إذا حدثت حالة سباق، احصل عليها مرة أخرى)
+        record = await conn.fetchrow("SELECT * FROM user_settings WHERE user_id = $1", user_id)
+        return BotSettings(**dict(record)) if record else None
+
 async def set_bot_status(user_id: UUID, is_running: bool) -> Optional[BotSettings]:
+    """(لـ /bot/start و /bot/stop) يحدّث حالة البوت."""
     async with db_connection() as conn:
         record = await conn.fetchrow(
             """
-            INSERT INTO user_settings (user_id, is_running) VALUES ($1, $2)
-            ON CONFLICT (user_id) DO UPDATE SET is_running = $2, updated_at = NOW()
-            RETURNING user_id, is_running, current_preset_name
+            UPDATE user_settings SET is_running = $1, updated_at = NOW()
+            WHERE user_id = $1
+            RETURNING *
             """,
-            user_id, is_running
+            is_running, user_id
         )
         return BotSettings(**dict(record)) if record else None
 
-async def get_bot_status(user_id: UUID) -> Optional[BotSettings]:
-    async with db_connection() as conn:
-        record = await conn.fetchrow("SELECT user_id, is_running, current_preset_name FROM user_settings WHERE user_id = $1", user_id)
-        if record:
-            return BotSettings(**dict(record))
-        return await set_bot_status(user_id, False)
+# (بقية دوال الخادم: save_api_keys, set_api_keys_valid, get_active_trades, ...)
+# (تبقى كما هي من V2)
 
 async def save_api_keys(user_id: UUID, api_key: str, secret_key: str, passphrase: Optional[str]) -> bool:
     def encrypt_key(key): return key + "_encrypted" # محاكاة
     try:
         async with db_connection() as conn:
+            # [تعديل V4] إضافة is_trial_key
+            # (هذا يحتاج منطق إضافي: هل هو في فترة تجريبية؟ هل هذا المفتاح مستخدم من قبل؟)
             await conn.execute(
                 """
-                INSERT INTO user_api_keys (user_id, api_key_encrypted, api_secret_encrypted, passphrase_encrypted, is_valid)
-                VALUES ($1, $2, $3, $4, false)
+                INSERT INTO user_api_keys (user_id, api_key_encrypted, api_secret_encrypted, passphrase_encrypted, is_valid, is_trial_key)
+                VALUES ($1, $2, $3, $4, false, true) -- (نفترض أنه مفتاح تجريبي مبدئياً)
                 ON CONFLICT (user_id, exchange) DO UPDATE
                 SET api_key_encrypted = $2, api_secret_encrypted = $3, passphrase_encrypted = $4, is_valid = false, created_at = NOW()
                 """,
@@ -332,3 +363,47 @@ async def mark_notification_read(user_id: UUID, notification_id: int) -> bool:
     async with db_connection() as conn:
         result = await conn.execute("UPDATE notifications SET is_read = true WHERE id = $1 AND user_id = $2", notification_id, user_id)
         return result == "UPDATE 1"
+
+# =================================================================
+# --- [جديد V4] دوال لربط التليجرام والدفع ---
+# =================================================================
+
+async def update_user_telegram_id(user_id: UUID, telegram_chat_id: int) -> bool:
+    """(لـ /telegram/link) يربط معرف تليجرام بحساب الويب."""
+    try:
+        async with db_connection() as conn:
+            await conn.execute(
+                "UPDATE user_settings SET telegram_chat_id = $1 WHERE user_id = $2",
+                telegram_chat_id, user_id
+            )
+        return True
+    except asyncpg.exceptions.UniqueViolationError:
+        logger.warning(f"Telegram ID {telegram_chat_id} is already linked to another account.")
+        return False # هذا الحساب مستخدم من قبل
+    except Exception as e:
+        logger.error(f"Failed to link Telegram ID for user {user_id}: {e}")
+        return False
+
+async def create_payment_request(user_id: UUID, txt_id: str, plan: str, wallet: str, amount: float) -> bool:
+    """(لـ /payment/submit) يسجل طلب الدفع اليدوي للمراجعة."""
+    try:
+        async with db_connection() as conn:
+            await conn.execute(
+                """
+                INSERT INTO manual_payments (user_id, txt_id, amount_paid, subscription_plan, wallet_address_used, status)
+                VALUES ($1, $2, $3, $4, $5, 'pending_review')
+                """,
+                user_id, txt_id, amount, plan, wallet
+            )
+            # [جديد] تحديث حالة المستخدم إلى "في انتظار الدفع"
+            await conn.execute(
+                "UPDATE user_settings SET subscription_status = 'pending_payment' WHERE user_id = $1",
+                user_id
+            )
+        return True
+    except asyncpg.exceptions.UniqueViolationError:
+        logger.warning(f"Duplicate TXT_ID submitted: {txt_id}")
+        return False # تم إرسال هذا المعرف من قبل
+    except Exception as e:
+        logger.error(f"Failed to create payment request for user {user_id}: {e}")
+        return False
